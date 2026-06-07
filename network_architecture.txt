@@ -1,0 +1,50 @@
+                                           ┌──────────────────────────────┐
+                                           │          Internet             │
+                                           └───────────────▲──────────────┘
+                                                           │
+                                                   (NAT / Policy)
+                                                           │
+                                 ┌──────────────────────────┴──────────────────────────┐
+                                 │                 FortiGate Firewall                  │
+                                 │  - DHCP for all VLANs                               │
+                                 │  - Guest VLAN → Internet only                       │
+                                 │  - User/Machine VLAN → Internal + Internet          │
+                                 │  - Critical VLAN (Fail-Open)                        │
+                                 │  - Server Segmentation Firewall Policies            │
+                                 └───────────────┬───────────────────────┬────────────┘
+                                                 │                       │
+                                                 │                       │
+                                 ┌───────────────┘                       └───────────────┐
+                                 │                                                       │
+                     ┌──────────────────────┐                               ┌──────────────────────┐
+                     │      Server VLAN     │                               │   Management VLAN    │
+                     │   10.10.0.0/24       │                               │   10.1.0.0/24        │
+                     │  AD / DNS / PKI /    │                               │  Switch Mgmt / FW    │
+                     │  NPS / File / SQL    │                               │  iDRAC / IPMI        │
+                     └───────────▲──────────┘                               └───────────▲──────────┘
+                                 │                                                      │
+                                 │ (Firewall controls all access)                       │
+                                 │                                                      │
+                     ┌───────────┴──────────────────────────────────────────────────────┴───────────┐
+                     │                                 Core L3 Switch                                 │
+                     │   - Trunk to Access Switches                                                   │
+                     │   - SVI (if not on FW)                                                         │
+                     │   - DHCP Relay (if DHCP on FW)                                                 │
+                     └───────────┬───────────────────────────────┬───────────────────────────────┬───┘
+                                 │                               │                               │
+                                 │                               │                               │
+                 ┌───────────────┘                               │                               └───────────────┐
+                 │                                               │                                               │
+     ┌──────────────────────┐                         ┌──────────────────────┐                         ┌──────────────────────┐
+     │ Access Switch (802.1X)│                         │ Access Switch (802.1X)│                         │ Access Switch (802.1X)│
+     │ - Authenticator       │                         │ - Authenticator       │                         │ - Authenticator       │
+     │ - EAPOL to NPS        │                         │ - EAPOL to NPS        │                         │ - EAPOL to NPS        │
+     │ - Dynamic VLAN        │                         │ - Dynamic VLAN        │                         │ - Dynamic VLAN        │
+     └───────────┬───────────┘                         └───────────┬───────────┘                         └───────────┬───────────┘
+                 │                                               │                                               │
+                 │                                               │                                               │
+     ┌───────────┴───────────┐                       ┌───────────┴───────────┐                       ┌───────────┴───────────┐
+     │ 802.1X Endpoints       │                       │ 802.1X Endpoints       │                       │ 802.1X Endpoints       │
+     │ - Windows 11 (Domain)  │                       │ - Laptops              │                       │ - IoT / Printers (MAB) │
+     │ - Machine Auth → VLAN10│                       │ - User Auth → VLAN20   │                       │ - Guest → VLAN200      │
+     └────────────────────────┘                       └────────────────────────┘                       └────────────────────────┘
