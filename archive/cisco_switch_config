@@ -1,0 +1,289 @@
+! VLAN設定
+vlan 10
+ name T0
+vlan 20
+ name T0PAW
+vlan 25
+ name T0BZ
+vlan 30
+ name T1
+vlan 35
+ name Printer
+vlan 37
+ name IoT
+vlan 38
+ name IPPhone
+vlan 40
+ name Registration
+vlan 50
+ name Machine
+vlan 60
+ name IT
+vlan 70
+ name GADept
+vlan 71
+ name MCDept
+vlan 72
+ name LADept
+vlan 73
+ name NTDept
+vlan 74
+ name NPDept
+vlan 75
+ name PIDept
+vlan 80
+ name CFDept
+vlan 90
+ name Guest
+vlan 98
+ name Critical
+
+! Core Switch 設定範本
+! =========================================================
+! 1. 系統基礎與管理層安全 (Management Security)
+! =========================================================
+hostname SW-HQ-Core-02
+ip domain-name corp.foo.bar.tw
+
+! 停用不安全服務
+no ip http server
+ip http secure-server
+no service telnet
+no ip source-route
+
+! 防爆破登入：15 秒內失敗 3 次，自動封鎖該 IP 60 秒
+login block-for 60 attempts 3 within 15
+
+! 僅允許 PAW 網段 (VLAN 20: 192.168.20.0/24) 存取管理介面
+ip access-list standard PAW-MGMT-ACL
+ permit 192.168.20.0 0.0.0.255
+
+line vty 0 15
+ access-class PAW-MGMT-ACL in
+ transport input ssh
+ exec-timeout 10 0
+
+! =========================================================
+! 2. 核心 SVI 管理介面與預設閘道
+! =========================================================
+! Tier 0 管理 VLAN (VLAN 10)
+interface Vlan10
+ description Tier 0 Switch Management
+ ip address 192.168.10.2 255.255.255.0
+ no ip redirects
+ no shutdown
+
+! 指向防火牆 (Router-on-a-Stick / Gateway)
+ip default-gateway 192.168.10.1
+
+! =========================================================
+! 3. 生成樹與 L2 區域防禦 (STP, DHCP Snooping, DAI, CoPP)
+! =========================================================
+! STP 最佳實踐：設定 Core Switch 為全網 Primary Root Bridge
+spanning-tree mode rapid-pvst
+spanning-tree vlan 10,20,25,30,35,37,38,40,50,60,70-75,80,90,98 priority 4096
+
+! 啟用 DHCP Snooping 與每 60 分鐘寫入 Flash
+ip dhcp snooping
+ip dhcp snooping vlan 10,20,25,30,35,37,38,40,50,60,70-75,80,90,98
+ip dhcp snooping database flash:core_dhcp_snoop.db
+ip dhcp snooping database write-delay 3600
+
+! 啟用 DAI (Dynamic ARP Inspection)
+ip arp inspection vlan 10,20,25,30,35,37,38,40,50,60,70-75,80,90,98
+
+! CoPP (Control Plane Policing) - 保護 CPU 不被 DoS / ICMP 塞爆
+ip access-list extended ICMP-COPP-ACL
+ permit icmp any any
+
+class-map match-all ICMP-CLASS
+ match access-group name ICMP-COPP-ACL
+
+policy-map COPP-POLICY
+ class ICMP-CLASS
+  police 80000 conform-action transmit exceed-action drop
+
+control-plane
+ service-policy input COPP-POLICY
+
+! =========================================================
+! 4. 實體介面配置 (Interfaces)
+! =========================================================
+
+! --- 4.1 Core Switch 接 Firewall Trunk (Ethernet0/0) ---
+! Firewall 擔任 Router-on-a-Stick & DHCP Server
+interface Ethernet0/0
+ description Upstream Trunk to Firewall (Router-on-a-Stick / DHCP)
+ switchport trunk encapsulation dot1q
+ switchport trunk native vlan 4094
+ switchport trunk allowed vlan 10,20,25,30,35,37,38,40,50,60,70-75,80,90,98
+ switchport mode trunk
+ ip dhcp snooping trust
+ ip arp inspection trust
+
+! --- 4.2 Core Switch 接 Server Port (Ethernet0/1) ---
+interface Ethernet0/1
+ description Trunk to Virtualization / Server Farm
+ switchport trunk encapsulation dot1q
+ ! Production 環境應設為 4094；Lab 環境 (VMware Workstation) 依需求設為 10
+ switchport trunk native vlan 10
+ switchport trunk allowed vlan 10,20,25,30
+ switchport mode trunk
+ spanning-tree portfast trunk
+ ip arp inspection trust
+ ! 放寬風暴控制：採用 pps 算，避免高載時誤殺
+ storm-control broadcast level pps 5000 3000
+ storm-control multicast level pps 5000 3000
+
+! --- 4.3 Core Switch 接 Edge Switch Trunk (Ethernet3/3) ---
+interface Ethernet3/3
+ description Downlink Trunk to Edge Switch (SW-HQ-Edge-120)
+ switchport trunk encapsulation dot1q
+ switchport trunk native vlan 4094
+ switchport trunk allowed vlan 10,20,25,30,35,37,38,40,50,60,70-75,80,90,98
+ switchport mode trunk
+ ip dhcp snooping trust
+ ip arp inspection trust
+ ! 鎖定 Core 主導權：禁止邊緣設備搶奪 Root Bridge 角色
+ spanning-tree guard root
+ ! 承載 300+ 台設備廣播，設定為上限 3000 pps
+ storm-control broadcast level pps 3000 1500
+ storm-control multicast level pps 3000 1500
+
+
+! Edge (Access) Swtich 設定範本
+! =========================================================
+! 1. 管理介面與安全性設定 (Tier 0 Management)
+! =========================================================
+hostname SW-HQ-Edge-250
+ip domain-name corp.foo.bar.tw
+
+! 停用不安全服務
+no ip http server
+ip http secure-server
+no service telnet
+no ip source-route
+
+! 防爆破登入：15 秒內失敗 3 次，自動封鎖該 IP 60 秒
+login block-for 60 attempts 3 within 15
+
+! 僅允許 PAW 網段 (VLAN 20: 192.168.20.0/24) 存取管理介面
+ip access-list standard PAW-MGMT-ACL
+ permit 192.168.20.0 0.0.0.255
+
+line vty 0 15
+ access-class PAW-MGMT-ACL in
+ transport input ssh
+ exec-timeout 10 0
+
+! =========================================================
+! 2. 核心 SVI 管理介面與預設閘道
+! =========================================================
+! Tier 0 管理 VLAN (VLAN 10)
+interface Vlan10
+ description Tier 0 Switch Management
+ ip address 192.168.10.250 255.255.255.0
+ no ip redirects
+ no shutdown
+
+! 指向防火牆 (Router-on-a-Stick / Gateway)
+ip default-gateway 192.168.10.1
+
+! =========================================================
+! 3. RADIUS & 802.1X 全局配置 (NPS: 192.168.10.13)
+! =========================================================
+aaa new-model
+aaa authentication dot1x default group radius
+aaa authorization network default group radius
+
+radius server NPS-192.168.10.13
+ address ipv4 192.168.10.13 auth-port 1812 acct-port 1813
+ key SuperSecretKey2026!
+
+dot1x system-auth-control
+
+! =========================================================
+! 4. L2 區域防禦 (DHCP Snooping / DAI / Loop Prevention)
+! =========================================================
+spanning-tree mode rapid-pvst
+spanning-tree portfast bpduguard default
+
+! 啟用 DHCP Snooping 與每 60 分鐘寫入 Flash
+ip dhcp snooping
+ip dhcp snooping vlan 10,20,25,30,35,37,38,40,50,60,70-75,80,90,98
+ip dhcp snooping database flash:dhcp_snoop.db
+ip dhcp snooping database write-delay 3600
+
+! 啟用 DAI
+ip arp inspection vlan 10,20,25,30,35,37,38,40,50,60,70-75,80,90,98
+
+! =========================================================
+! 5. 實體介面配置 (Interfaces)
+! =========================================================
+
+! --- Trunk Port (接 Core Switch) ---
+interface Ethernet0/0
+ description Upstream Link to Core Switch
+ switchport trunk encapsulation dot1q
+ switchport trunk native vlan 4094
+ switchport trunk allowed vlan 10,20,25,30,35,37,38,40,50,60,70-75,80,90,98
+ switchport mode trunk
+ ip dhcp snooping trust
+ ip arp inspection trust
+
+! --- Ethernet0/1: Wi-Fi AP (Rate 100) ---
+interface Ethernet0/1
+ description Access/Trunk to Wireless AP
+ switchport mode access
+ switchport access vlan 40
+ spanning-tree portfast
+ ip arp inspection limit rate 100
+
+! --- Ethernet0/2: 單一主機 / PAW (Single Host, Rate 15) ---
+interface Ethernet0/2
+ description Single Host / PAW
+ switchport mode access
+ switchport access vlan 40
+ 
+ ! 802.1X & MAB 認證
+ authentication host-mode single-host
+ authentication port-control auto
+ mab
+ dot1x pae authenticator
+ 
+ ! Guest VLAN 90 / Critical VLAN 98
+ authentication event fail action authorize vlan 90
+ authentication event server dead action authorize vlan 98
+ 
+ ! Port 防護 (IPSG / DAI / Port Security 1 MAC)
+ ip arp inspection limit rate 15
+ ip verify source
+ switchport port-security maximum 1
+ switchport port-security violation restrict
+ switchport port-security
+ spanning-tree portfast
+
+! --- Ethernet0/3: IP Phone + PC 串接 (Multi-Domain, Rate 15) ---
+interface Ethernet0/3
+ description IP Phone with Daisy-Chained PC
+ switchport mode access
+ switchport access vlan 40
+ switchport voice vlan 38
+ 
+ ! Multi-Domain 模式 (1 Voice MAC + 1 Data MAC)
+ authentication host-mode multi-domain
+ authentication port-control auto
+ mab
+ dot1x pae authenticator
+ 
+ ! Guest VLAN 90 / Critical VLAN 98
+ authentication event fail action authorize vlan 90
+ authentication event server dead action authorize vlan 98
+ 
+ ! Port 防護 (IPSG / DAI / Port Security 2 MACs)
+ ip arp inspection limit rate 15
+ ip verify source
+ switchport port-security maximum 2
+ switchport port-security violation restrict
+ switchport port-security
+ spanning-tree portfast

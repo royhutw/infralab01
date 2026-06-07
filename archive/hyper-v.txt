@@ -1,0 +1,18 @@
+﻿# 更改某架Hyper-V VM某指定MAC Address網卡名稱
+Get-VMNetworkAdapter -VMName "您的VM名稱" | Where-Object {$_.MacAddress -eq "00155D0B7801"} | Rename-VMNetworkAdapter -NewName "LAN"
+
+# Uniquely named net adaptor in VM
+Set-VMNetworkAdaptervlan -VMName "您的VM名稱" -VMNetworkAdapterName "LAN" -Trunk -AllowedVlanIdList "10,20,25,30,35,37,38,40,50,60,70,71,72,73,74,75,80,90,98" -NativeVlanId 999
+
+# Single net adaptor in VM
+Get-VMNetworkAdapter -VMName "您的VM名稱" | Set-VMNetworkAdapterVlan -Trunk -AllowedVlanIDList "10,20,25,30" -NativeVlanId 999
+
+# 回復預設值(UNTAGGED)
+Set-VMNetworkAdapterVlan -VMName "您的pfSense虛擬機名稱" -Untagged
+
+# Non-uniquely named adaptor
+Get-VMNetworkAdapter -VMName lab-guest | Where-Object {$_.MacAddress -eq '00155D23930D'} | Set-VMNetworkAdapterVlan -Trunk -AllowedVlanIdList "10,20,30" -NativeVlanId 0
+
+Initially I was trying to set it like this:
+Get-VMNetworkAdapter -VMName lab-guest | Set-VMNetworkAdapterVlan -Trunk -AllowedVlanIDList 1-100 -NativeVlanId 10
+
