@@ -1,0 +1,205 @@
+﻿! =========================================================
+! Core Switch 設定範本 (SW-HQ-Core-02)
+! =========================================================
+
+! 0. 全局 VLAN 宣告 (包含 Native VLAN 黑洞 4094)
+vlan 10
+ name T0
+vlan 20
+ name T0PAW
+vlan 25
+ name T0BZ
+vlan 30
+ name T1
+vlan 35
+ name Printer
+vlan 37
+ name IoT
+vlan 38
+ name IPPhone
+vlan 40
+ name Registration
+vlan 50
+ name Machine
+vlan 60
+ name IT
+vlan 70
+ name GADept
+vlan 71
+ name MCDept
+vlan 72
+ name LADept
+vlan 73
+ name NTDept
+vlan 74
+ name NPDept
+vlan 75
+ name PIDept
+vlan 80
+ name CFDept
+vlan 90
+ name Guest
+vlan 98
+ name Critical
+vlan 4094
+ name NATIVE_NULL
+
+! =========================================================
+! 1. 系統基礎、時間與管理層安全 (Management Security & Logging)
+! =========================================================
+hostname SW-HQ-Core-02
+ip domain name corp.foo.bar.tw
+
+! 時間戳記與時區設定
+clock timezone GMT 8 0
+service timestamps log datetime msec show-timezone
+service timestamps debug datetime msec show-timezone
+
+! NTP 時間同步設定 (NTP Server: 192.168.10.1)
+ntp server 192.168.10.1 source Vlan 10 prefer
+
+! Syslog 伺服器設定 (Syslog Server: 192.168.10.50)
+logging host 192.168.10.50
+logging source-interface Vlan 10
+logging trap informational
+
+crypto key generate rsa modulus 2048
+ip ssh version 2
+
+! 停用不安全服務
+no ip http server
+ip http secure-server
+no service telnet
+no ip source-route
+
+! 防爆破登入：15 秒內失敗 3 次，自動封鎖該 IP 60 秒
+login block-for 60 attempts 3 within 15
+
+! 僅允許 PAW 網段 (VLAN 20: 192.168.20.0/24) 存取管理介面
+ip access-list standard PAW-MGMT-ACL
+ permit 192.168.20.0 0.0.0.255
+
+! Production 環境上線時請將密碼修改為強式密碼
+aaa new-model
+username netadmin privilege 15 secret P@ssw0rd
+enable secret P@ssw0rd
+aaa authentication login default local
+
+! 選擇4是因為IOU僅開放5個通道, Production環境請依實際需求修改
+line vty 0 4
+ access-class PAW-MGMT-ACL in
+ transport input ssh
+ exec-timeout 10 0
+ login authentication default
+
+! =========================================================
+! 2. 核心 SVI 管理介面與預設閘道
+! =========================================================
+! Tier 0 管理 VLAN (VLAN 10)
+interface Vlan10
+ description Tier 0 Switch Management
+ ip address 192.168.10.2 255.255.255.0
+ no ip redirects
+ no shutdown
+
+! 指向防火牆 (Router-on-a-Stick / Gateway)
+ip default-gateway 192.168.10.1
+
+! =========================================================
+! 3. 生成樹與 L2 區域防禦 (STP, DHCP Snooping, DAI, CoPP)
+! =========================================================
+! STP 最佳實踐：設定 Core Switch 為全網 Primary Root Bridge
+spanning-tree mode rapid-pvst
+spanning-tree vlan 10,20,25,30,35,37,38,40,50,60,70-75,80,90,98 priority 4096
+
+! 啟用 DHCP Snooping 與每 60 分鐘寫入 Flash
+ip dhcp snooping
+! 加載 Option 82 安全開關
+no ip dhcp snooping information option
+ip dhcp snooping vlan 10,20,25,30,35,37,38,40,50,60,70-75,80,90,98
+! Production 環境使用flash, 檔案命稱請依照實際需求修改
+!ip dhcp snooping database flash:/core_dhcp_snoop.db
+! IOU 環境使用unix, 檔案命稱請依照實際需求修改
+ip dhcp snooping database unix:/core_dhcp_snoop.db
+ip dhcp snooping database write-delay 3600
+
+! 啟用 DAI (Dynamic ARP Inspection)
+ip arp inspection vlan 10,20,25,30,35,37,38,40,50,60,70-75,80,90,98
+! 檢查:來源MAC是否與Ethernet表頭一致(src-mac)、
+! 目的MAC是否合理(dst-mac,主要對ARP Reply有效)、
+! 以及IP是否合法(ip)
+! 加了下面這行之後,建議先觀察一段時間 show ip arp inspection statistics
+ip arp inspection validate src-mac dst-mac ip
+
+! CoPP (Control Plane Policing) - 保護 CPU 不被 DoS / ICMP 塞爆
+ip access-list extended ICMP-COPP-ACL
+ permit icmp any any
+
+class-map match-all ICMP-CLASS
+ match access-group name ICMP-COPP-ACL
+
+policy-map COPP-POLICY
+ class ICMP-CLASS
+  police 80000 conform-action transmit exceed-action drop
+
+control-plane
+ service-policy input COPP-POLICY
+
+! =========================================================
+! 4. 實體介面配置 (Interfaces)
+! =========================================================
+
+! err-disable 自動恢復——如果多台 VM 同時開機導致短暫超過 rate limit 被 err-disable
+! 加上自動復原,避免每次都要手動 shutdown/no shutdown
+errdisable recovery cause dhcp-rate-limit
+errdisable recovery cause arp-inspection
+errdisable recovery interval 30
+
+! --- 4.1 Core Switch 接 Firewall Trunk (Ethernet0/0) ---
+interface Ethernet0/0
+ description Upstream Trunk to Firewall (Router-on-a-Stick / DHCP)
+ switchport trunk encapsulation dot1q
+ switchport trunk native vlan 4094
+ switchport trunk allowed vlan 10,20,25,30,35,37,38,40,50,60,70-75,80,90,98
+ switchport mode trunk
+ ip dhcp snooping trust
+ ip arp inspection trust
+
+! --- 4.2 Core Switch 接 Server Port (Ethernet0/1) ---
+interface Ethernet0/1
+ description Trunk to Virtualization / Server Farm
+ switchport trunk encapsulation dot1q
+ ! Production 環境應設為 4094, 實體機/VM之NIC/vNIC需指定VLAN ID；Lab 環境 (VMware Workstation) 依需求設為 10
+ switchport trunk native vlan 10
+ switchport trunk allowed vlan 10,20,25,30
+ switchport mode trunk
+ spanning-tree portfast trunk
+ ! 移除 ip arp inspection trust，改由DAI正常檢查
+ ! 移除後不要漏加下面這行，否則多台VM同時開機/送Gratuitous ARP時
+ ! 可能超過預設速率被err-disable
+ ip arp inspection limit rate 200 burst interval 1
+ ! DHCP Snooping維持untrusted(預設)，因為這個Port本來就沒有合法DHCP Server
+ ! (不需要額外下 no ip dhcp snooping trust，untrusted本來就是預設值)
+ ! IOU環境無須設定storm-control, Production 環境建議設定
+ storm-control broadcast level pps 5000 3000
+ storm-control multicast level pps 5000 3000
+ ! 語法: ip source binding <VM的MAC> vlan <VLAN_ID> <VM的靜態IP> interface Ethernet0/1
+ ! 範例(請替換成實際的MAC/IP，以下純示意)
+ ! ip source binding 000c.298f.6b63 vlan 10 192.168.10.10 interface Ethernet0/1
+ ! ip source binding 000c.29af.eccd vlan 10 192.168.10.12 interface Ethernet0/2
+ ! ip source binding 000c.2976.79f7 vlan 10 192.168.25.13 interface Ethernet0/3
+ ! ip source binding 0050.5600.0004 vlan 30 192.168.30.5  interface Ethernet0/1
+
+! --- 4.3 Core Switch 接 Edge Switch Trunk (Ethernet3/3) ---
+interface Ethernet3/3
+ description Downlink Trunk to Edge Switch (SW-HQ-Edge-200)
+ switchport trunk encapsulation dot1q
+ switchport trunk native vlan 4094
+ switchport trunk allowed vlan 10,20,25,30,35,37,38,40,50,60,70-75,80,90,98
+ switchport mode trunk
+ ip dhcp snooping trust
+ ip arp inspection trust
+ spanning-tree guard root
+ ! IOU環境無須設定storm-control, Production 環境建議設定
+ storm-control broadcast level pps 3000 1500
+ storm-control multicast level pps 3000 1500

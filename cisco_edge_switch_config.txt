@@ -1,0 +1,325 @@
+﻿! =========================================================
+! Edge (Access) Switch 設定範本 (SW-HQ-Edge-200)
+! =========================================================
+
+! 0. 全局 VLAN 宣告 (包含 Native VLAN 黑洞 4094)
+vlan 10
+ name T0
+vlan 20
+ name T0PAW
+vlan 25
+ name T0BZ
+vlan 30
+ name T1
+vlan 35
+ name Printer
+vlan 37
+ name IoT
+vlan 38
+ name IPPhone
+vlan 40
+ name Registration
+vlan 50
+ name Machine
+vlan 60
+ name IT
+vlan 70
+ name GADept
+vlan 71
+ name MCDept
+vlan 72
+ name LADept
+vlan 73
+ name NTDept
+vlan 74
+ name NPDept
+vlan 75
+ name PIDept
+vlan 80
+ name CFDept
+vlan 90
+ name Guest
+vlan 98
+ name Critical
+vlan 4094
+ name NATIVE_NULL
+
+! =========================================================
+! 1. 系統基礎、時間與管理層安全 (Management Security & Logging)
+! =========================================================
+hostname SW-HQ-Edge-200
+ip domain name corp.foo.bar.tw
+
+! 時間戳記與時區設定
+clock timezone GMT 8 0
+service timestamps log datetime msec show-timezone
+service timestamps debug datetime msec show-timezone
+
+! NTP 時間同步設定 (NTP Server: 192.168.10.1)
+ntp server 192.168.10.1 source Vlan 10 prefer
+
+! Syslog 伺服器設定 (Syslog Server: 192.168.10.50)
+logging host 192.168.10.50
+logging source-interface Vlan 10
+logging trap informational
+
+crypto key generate rsa modulus 2048
+ip ssh version 2
+
+! 停用不安全服務
+no ip http server
+ip http secure-server
+no service telnet
+no ip source-route
+
+! 防爆破登入：15 秒內失敗 3 次，自動封鎖該 IP 60 秒
+login block-for 60 attempts 3 within 15
+
+! 僅允許 PAW 網段 (VLAN 20: 192.168.20.0/24) 存取管理介面
+ip access-list standard PAW-MGMT-ACL
+ permit 192.168.20.0 0.0.0.255
+
+! Production 環境上線時請將密碼修改為強式密碼
+username netadmin privilege 15 secret P@ssw0rd
+enable secret P@ssw0rd
+aaa authentication login default local
+
+! 選擇4是因為IOU僅開放5個通道, Production環境請依實際需求修改
+line vty 0 4
+ access-class PAW-MGMT-ACL in
+ transport input ssh
+ exec-timeout 10 0
+ login authentication default
+
+! =========================================================
+! 2. 核心 SVI 管理介面與預設閘道
+! =========================================================
+! Tier 0 管理 VLAN (VLAN 10)
+interface Vlan10
+ description Tier 0 Switch Management
+ ip address 192.168.10.200 255.255.255.0
+ no ip redirects
+ no shutdown
+
+! 指向防火牆 (Router-on-a-Stick / Gateway)
+ip default-gateway 192.168.10.1
+
+! =========================================================
+! 3. RADIUS & 802.1X 全局配置 (NPS: 192.168.10.13)
+! =========================================================
+aaa new-model
+
+radius-server dead-criteria time 5 tries 2
+radius-server deadtime 5
+radius server NPS-1
+ address ipv4 192.168.10.13 auth-port 1812 acct-port 1813
+ key 0 P@ssw0rd
+ timeout 2
+ retransmit 2
+! Production 環境上線時請將密碼修改為強式密碼
+radius server NPS-2
+ address ipv4 192.168.10.14 auth-port 1812 acct-port 1813
+ key 0 P@ssw0rd
+ timeout 2
+ retransmit 2
+! Production 環境上線時請將密碼修改為強式密碼
+aaa group server radius NPS-GROUP
+ server name NPS-1
+ server name NPS-2
+ deadtime 5
+
+aaa authentication dot1x default group NPS-GROUP
+aaa authorization network default group NPS-GROUP
+aaa accounting dot1x default start-stop group NPS-GROUP
+!
+! 啟用 RADIUS 動態指派 VLAN 所需的屬性支援
+! Production 環境上線時請將密碼修改為強式密碼
+aaa server radius dynamic-author
+ client 192.168.10.13 server-key 0 P@ssw0rd
+ client 192.168.10.14 server-key 0 P@ssw0rd
+ auth-type any
+! 註: NPS原生不支援發起CoA，此區塊主要是保留擴充性(若日後改用ISE)
+
+dot1x system-auth-control
+
+! =========================================================
+! 4. L2 區域防禦 (DHCP Snooping / DAI / Loop Prevention)
+! =========================================================
+spanning-tree mode rapid-pvst
+spanning-tree portfast bpduguard default
+
+! 啟用 DHCP Snooping 與每 60 分鐘寫入 Flash
+ip dhcp snooping
+! 加載 Option 82 安全開關
+no ip dhcp snooping information option
+ip dhcp snooping vlan 10,20,25,30,35,37,38,40,50,60,70-75,80,90,98
+! Production 環境使用flash, 檔案命稱請依照實際需求修改
+! ip dhcp snooping database flash:/edge_200_dhcp_snoop.db
+! IOU 環境使用unix, 檔案命稱請依照實際需求修改
+ip dhcp snooping database unix:/edge_200_dhcp_snoop.db
+ip dhcp snooping database write-delay 3600
+
+! 啟用 DAI
+ip arp inspection vlan 10,20,25,30,35,37,38,40,50,60,70-75,80,90,98
+! 檢查:來源MAC是否與Ethernet表頭一致(src-mac)、
+! 目的MAC是否合理(dst-mac,主要對ARP Reply有效)、
+! 以及IP是否合法(ip)
+! 加了下面這行之後,建議先觀察一段時間 show ip arp inspection statistics
+ip arp inspection validate src-mac dst-mac ip
+
+! =========================================================
+! 5. 實體介面配置 (Interfaces)
+! =========================================================
+
+! err-disable 自動恢復
+! 加上自動復原,避免每次都要手動 shutdown/no shutdown
+errdisable recovery cause dhcp-rate-limit
+errdisable recovery cause arp-inspection
+errdisable recovery interval 30
+
+! --- Trunk Port (接 Core Switch) ---
+interface Ethernet0/0
+ description Upstream Link to Core Switch
+ switchport trunk encapsulation dot1q
+ switchport trunk native vlan 4094
+ switchport trunk allowed vlan 10,20,25,30,35,37,38,40,50,60,70-75,80,90,98
+ switchport mode trunk
+ ip dhcp snooping trust
+ ip arp inspection trust
+
+! --- Ethernet0/1: Wi-Fi AP (Rate 100) ---
+interface Ethernet0/1
+ description Access/Trunk to Wireless AP
+ switchport trunk encapsulation dot1q
+ switchport mode trunk
+ switchport trunk native vlan 40
+ spanning-tree portfast trunk
+ ip arp inspection limit rate 100
+
+! --- Ethernet0/2: IP Phone + PC 串接 (Multi-Domain, Rate 15) ---
+! --- 請依據實際狀況設定
+interface Ethernet0/2
+ description IP Phone with Daisy-Chained PC
+ switchport mode access
+ switchport access vlan 40
+ switchport voice vlan 38
+ 
+ ! Multi-Domain 模式 (1 Voice MAC + 1 Data MAC)
+ authentication host-mode multi-domain
+ authentication order dot1x mab
+ authentication priority dot1x mab
+ authentication port-control auto
+ authentication violation restrict
+ mab
+ dot1x pae authenticator
+ dot1x timeout tx-period 5
+ dot1x max-reauth-req 2
+ 
+ ! Guest VLAN 90 / Critical VLAN 98
+ authentication event server alive action reinitialize
+ authentication periodic
+ authentication timer reauthenticate server
+ authentication event fail action authorize vlan 90
+ authentication event no-response action authorize vlan 90
+ authentication event server dead action authorize vlan 98
+ 
+ ! Port 防護 (IPSG / DAI / Port Security 2 MACs)
+ ip arp inspection limit rate 15
+ ip dhcp snooping limit rate 15
+ ! 暫停 ip verify source
+ switchport port-security maximum 2
+ switchport port-security violation restrict
+ switchport port-security
+ spanning-tree portfast
+
+! --- Ethernet0/3: 單一主機 / PAW (Single Host, Rate 15) ---
+! --- 請依據實際狀況設定
+interface Ethernet0/3
+ description Single Host / PAW
+ switchport mode access
+ switchport access vlan 90
+ 
+ ! 802.1X & MAB 認證與順序優化
+ authentication order dot1x mab
+ authentication priority dot1x mab
+ authentication port-control auto
+ authentication periodic
+ authentication timer reauthenticate server
+ mab
+ dot1x pae authenticator
+ dot1x timeout tx-period 5
+ dot1x max-reauth-req 2
+ dot1x max-req 1
+ 
+ ! Guest VLAN 90 / Critical VLAN 98
+ authentication event server alive action reinitialize
+ authentication event fail action authorize vlan 90
+ authentication event no-response action authorize vlan 90
+ authentication event server dead action authorize vlan 98
+ 
+ ! Port 防護 (IPSG / DAI / Port Security 1 MAC)
+ ip arp inspection limit rate 15
+ ip dhcp snooping limit rate 15
+ ! 暫停 ip verify source
+ switchport port-security maximum 1
+ switchport port-security violation restrict
+ switchport port-security
+ spanning-tree portfast
+
+! --- Ethernet3/3: Edge-to-Edge Downlink Trunk ---
+interface Ethernet3/3
+ description Downlink to another Edge Swtich
+ switchport trunk encapsulation dot1q
+ switchport trunk native vlan 4094
+ switchport trunk allowed vlan 10,20,25,30,35,37,38,40,50,60,70-75,80,90,98
+ switchport mode trunk
+ ip dhcp snooping trust
+ ip arp inspection trust
+ ! 若能確保下層 Edge 絕不會調整 STP Priority，可保留 root guard；否則建議移除以避免誤鎖
+ ! spanning-tree guard root
+ ! Production 環境建議開啟廣播與多播風暴控制
+ storm-control broadcast level pps 3000 1500
+ storm-control multicast level pps 3000 1500
+
+ ! Monitoring 命令（上線後必跑）
+ ! 802.1X / MAB / 認證 Session 狀態
+ ! show aaa sessions
+ ! RADIUS / AAA 連線狀況
+ ! show aaa servers
+ ! show radius server-group all
+ ! show radius statistics
+ ! test aaa group NPS-GROUP username <帳號> password <密碼> legacy
+ ! DHCP Snooping 深入診斷
+ ! show ip dhcp snooping binding
+ ! show ip dhcp snooping
+ ! show ip dhcp snooping statistics detail
+ ! show ip dhcp snooping database
+ ! DAI 深入診斷
+ ! show ip arp inspection interfaces
+ ! show ip arp inspection log
+ ! show ip arp inspection vlan 90
+ ! Port-Security 狀態
+ ! show port-security
+ ! show port-security interface Et0/2
+ ! show port-security address
+ ! STP 健康狀況
+ ! show spanning-tree inconsistentports
+ ! show spanning-tree summary
+ ! show spanning-tree detail | include is executing|occurred|from
+ ! show spanning-tree vlan 10
+ ! show interfaces status err-disabled
+ ! Trunk / VLAN 一致性檢查
+ ! show interfaces trunk
+ ! show vlan brief
+ ! show interfaces switchport
+ ! 整體錯誤日誌彙總
+ ! show logging | include %SW_DAI|%DOT1X|%MAB|%AUTHMGR|%DHCP_SNOOPING|%PM-4-ERR_DISABLE
+ ! 建議的日常巡檢優先順序(從快到慢):
+ ! show interfaces status err-disabled
+ ! show authentication sessions
+ ! show aaa servers
+ ! 有異常再深入對應的 details/statistics/log 指令查根因
+ ! CoPP / Control-Plane 流量監控 (適用於實體機)
+ ! show policy-map control-plane
+ ! show policy-map interface control-plane
+ ! show platform hardware qfp active feature cpp status
