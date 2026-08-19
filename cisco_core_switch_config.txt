@@ -1,0 +1,323 @@
+! =========================================================
+! Core Switch 設定範本 (SW-HQ-Core-2)
+! 實驗設備: GNS3 x86_64_crb_linux_l2-adventerprisek9-ms & WS-C2960X-24TS-L
+! =========================================================
+
+! 全局 VLAN 宣告 (包含 Native VLAN 黑洞 999)
+vlan 10
+ name T0
+vlan 20
+ name T0PAW
+vlan 25
+ name T0BZ
+vlan 30
+ name T1
+vlan 34
+ name WiFiAPMgmt
+vlan 35
+ name Printer
+vlan 37
+ name IoT
+vlan 38
+ name IPPhone
+vlan 40
+ name Registration
+vlan 50
+ name Machine
+vlan 60
+ name IT
+vlan 70
+ name GADept
+vlan 71
+ name MCDept
+vlan 72
+ name LADept
+vlan 73
+ name NTDept
+vlan 74
+ name NPDept
+vlan 75
+ name PIDept
+vlan 80
+ name CFDept
+vlan 90
+ name Guest
+vlan 98
+ name Critical
+vlan 999
+ name NATIVE_NULL
+
+! ============================
+! System Identity & Base Hardening
+! ============================
+hostname SW-HQ-Core-2
+ip domain name corp.foo.bar.tw
+
+! 停用不安全管理通道（避免明文密碼）
+no ip http server
+ip http secure-server
+no service telnet
+
+! 停用不必要的 L2 探測（避免拓撲外洩）
+no cdp run
+
+! 停用不安全路由功能（避免 MITM）
+no ip source-route
+
+! 啟用 SSH（最低 2048-bit）
+crypto key generate rsa modulus 2048
+ip ssh version 2
+
+! ============================
+! Tier 0 Management VLAN
+! ============================
+interface Vlan10
+ description Tier 0 Switch Management
+ ip address 192.168.10.2 255.255.255.0
+ ! 避免 MITM 攻擊
+ no ip redirects
+ no shutdown
+
+! ============================
+! Default Route (to Firewall)
+! ============================
+! 若為Layer 3 switch要啟用SVI請使用ip route指令
+! ip route 0.0.0.0 0.0.0.0 192.168.10.1
+! 若為Layer 2 switch則使用 ip default-gateway指令
+ip default-gateway 192.168.10.1
+
+! ============================
+! Time Synchronization
+! ============================
+clock timezone GMT 8 0
+service timestamps log datetime msec show-timezone
+service timestamps debug datetime msec show-timezone
+
+! NTP 是 AAA / Syslog / PKI / 802.1X 的基礎
+ntp server 192.168.10.1 source Vlan10 prefer
+ntp server time.stdtime.gov.tw
+ntp server time.google.com
+ntp server time.cloudflare.com
+
+! ============================
+! AAA & Local Auth
+! ============================
+aaa new-model
+
+! Production 請改用 TACACS+ / RADIUS, Production環境請改為較高強度密碼
+username netadmin privilege 15 secret P@ssw0rd
+enable secret P@ssw0rd
+
+aaa authentication login default local
+
+! 防爆破登入（SSH 暴力破解防護）
+login block-for 60 attempts 3 within 15
+
+! ============================
+! PAW Management ACL
+! ============================
+ip access-list standard PAW-MGMT-ACL
+! 僅允許 PAW VLAN 管理交換器
+ permit 192.168.20.0 0.0.0.255
+
+! ============================
+! VTY Lines (SSH Only)
+! ============================
+! 選擇4是因為IOU僅開放5個通道, Production環境請依實際需求修改
+line vty 0 4
+ access-class PAW-MGMT-ACL in
+ transport input ssh
+ ! 避免殭屍連線佔用 VTY
+ exec-timeout 10 0
+ login authentication default
+
+! ============================
+! Syslog
+! ============================
+logging host 192.168.10.50
+logging source-interface Vlan10
+! NAC/802.1X 排查最低等級
+logging trap informational
+logging buffered informational
+
+! =========================================================
+! 生成樹與 L2 區域防禦 (STP, DHCP Snooping, DAI, CoPP)
+! =========================================================
+! STP 最佳實踐：設定 Core Switch 為全網 Primary Root Bridge
+spanning-tree mode rapid-pvst
+! 明確指定 Core Switch 為 STP Root
+! 不使用 root primary 巨集，以避免依現有 STP 拓撲動態計算 priority
+! Production 環境應明確規劃 Root / Secondary Root 的 priority
+spanning-tree vlan 10,20,25,30,34,35,37,38,40,50,60,70-75,80,90,98 priority 4096
+spanning-tree loopguard default
+
+! ============================
+! DHCP Snooping Baseline
+! ============================
+! 啟用 DHCP Snooping（IPSG / DAI 的基礎）
+ip dhcp snooping
+! Option 82：若 DHCP Server 不支援或 IoT 裝置異常才關閉
+! no ip dhcp snooping information option
+! 加入所有 Access VLAN（避免漏掉 VLAN 導致 IPSG 阻擋合法主機）
+ip dhcp snooping vlan 34,35,37,38,40,50,60,70-75,80,90,98
+! Snooping DB：避免 Switch 重開後綁定表消失
+! IOU 環境使用unix, 檔案命稱請依照實際需求修改
+! Production 環境使用flash, 檔案命稱請依照實際需求修改
+!ip dhcp snooping database unix:/core02_dhcp_snoop.db
+ip dhcp snooping database flash:/core02_dhcp_snoop.db
+! 建議 300 秒（5 分鐘）避免綁定表過期太久
+ip dhcp snooping database write-delay 300
+! 防止 MAC spoof / Rogue DHCP Client
+ip dhcp snooping verify mac-address
+
+! 啟用 DAI (Dynamic ARP Inspection)
+ip arp inspection vlan 34,35,37,38,40,50,60,70-75,80,90,98
+
+! =========================================================
+! CoPP (Control Plane Policing) - 保護 CPU
+! =========================================================
+
+! 只保留 STP 與 LLDP 這兩個既有policy-map沒有涵蓋的部分 (待測試)
+mls qos copp protocol stp police pps 100
+mls qos copp protocol lldp police pps 100
+
+! ============================
+! ICMP
+! ============================
+ip access-list extended ICMP-COPP-ACL
+ permit icmp any any
+
+class-map match-all ICMP-CLASS
+ match access-group name ICMP-COPP-ACL
+
+! ============================
+! ARP
+! ============================
+class-map match-any ARP-CLASS
+ match protocol arp
+
+! ============================
+! DHCP
+! ============================
+ip access-list extended DHCP-COPP-ACL
+ permit udp any eq 67 any
+ permit udp any eq 68 any
+
+class-map match-all DHCP-CLASS
+ match access-group name DHCP-COPP-ACL
+
+! ============================
+! 802.1X / RADIUS
+! ============================
+ip access-list extended RADIUS-COPP-ACL
+ permit udp any eq 1812 any
+ permit udp any eq 1813 any
+
+class-map match-all RADIUS-CLASS
+ match access-group name RADIUS-COPP-ACL
+
+! ============================
+! SSH
+! ============================
+ip access-list extended SSH-COPP-ACL
+ permit tcp any any eq 22
+
+class-map match-all SSH-CLASS
+ match access-group name SSH-COPP-ACL
+
+! ============================
+! Policy-map
+! ============================
+policy-map COPP-POLICY
+ class ICMP-CLASS
+  police 256000 conform-action transmit exceed-action drop
+
+ class ARP-CLASS
+  police rate 500 pps burst 1000 packets conform-action transmit exceed-action drop
+
+ class DHCP-CLASS
+  police 128000 conform-action transmit exceed-action drop
+
+ class RADIUS-CLASS
+  police 256000 conform-action transmit exceed-action drop
+
+ class SSH-CLASS
+  police 128000 conform-action transmit exceed-action drop
+
+ class class-default
+  ! 建議上線後先觀察 show policy-map control-plane 一段時間，
+  ! 確認 class-default 沒有誤傷合法流量後，再將 exceed-action 改為 drop
+  police rate 100 pps burst 200 packets conform-action transmit exceed-action transmit
+  ! police rate 100 pps burst 200 packets conform-action transmit exceed-action drop
+
+! ============================
+! input service-policy
+! ============================
+control-plane
+ service-policy input COPP-POLICY
+
+! =========================================================
+! 實體介面配置 (Interfaces)
+! =========================================================
+! err-disable 自動恢復——如果多台 VM 同時開機導致短暫超過 rate limit 被 err-disable
+! 加上自動復原,避免每次都要手動 shutdown/no shutdown
+errdisable recovery cause dhcp-rate-limit
+errdisable recovery cause arp-inspection
+errdisable recovery interval 300
+errdisable recovery cause bpduguard
+
+! Core Switch 接 Firewall Trunk (GigabitEthernet0/0)
+interface GigabitEthernet0/0
+ description Upstream Trunk to Firewall (Router-on-a-Stick / DHCP)
+ switchport trunk encapsulation dot1q
+ switchport trunk native vlan 999
+ switchport trunk allowed vlan 10,20,25,30,34,35,37,38,40,50,60,70-75,80,90,98
+ switchport mode trunk
+ ip dhcp snooping trust
+ ip arp inspection trust
+! IOU環境無須設定storm-control, Production 環境建議設定
+ storm-control broadcast level pps 3000 1500
+ storm-control multicast level pps 3000 1500 
+ 
+! Core Switch 接 Server Port (GigabitEthernet0/1)
+interface GigabitEthernet0/1
+ description Trunk to Virtualization or Server Farm
+ switchport trunk encapsulation dot1q
+ ! Production 環境應設為 999, 實體機/VM之NIC/vNIC需指定VLAN ID；Lab 環境 (VMware Workstation) 依需求設為 10
+ switchport trunk native vlan 10
+ switchport trunk allowed vlan 10,20,25,30
+ switchport mode trunk
+ spanning-tree portfast trunk
+ ! 由虛擬化網路管理MAC Address, IP Address & ARP降低維運負擔
+ ip dhcp snooping trust
+ ip arp inspection trust
+ ! IOU環境無須設定storm-control, Production 環境建議設定
+ storm-control broadcast level pps 5000 3000
+ storm-control multicast level pps 5000 3000
+
+ ! Core Switch 接另一架 Core Switch Trunk (GigabitEthernet3/2)
+interface GigabitEthernet3/2
+ description Downlink Trunk to Core Switch Extension (SW-HQ-Core-3)
+ switchport trunk encapsulation dot1q
+ switchport trunk native vlan 999
+ switchport trunk allowed vlan 10,20,25,30,34,35,37,38,40,50,60,70-75,80,90,98
+ switchport mode trunk
+ ip dhcp snooping trust
+ ip arp inspection trust
+  ! IOU環境無須設定storm-control, Production 環境建議設定
+ storm-control broadcast level pps 3000 1500
+ storm-control multicast level pps 3000 1500
+
+ ! Core Switch 接 Edge Switch Trunk (GigabitEthernet3/3)
+interface GigabitEthernet3/3
+ description Downlink Trunk to Edge Switch (SW-HQ-Edge-200)
+ switchport trunk encapsulation dot1q
+ switchport trunk native vlan 999
+ switchport trunk allowed vlan 10,34,35,37,38,40,50,60,70-75,80,90,98
+ switchport mode trunk
+ ip dhcp snooping trust
+ ip arp inspection trust
+ spanning-tree guard root
+  ! IOU環境無須設定storm-control, Production 環境建議設定
+ storm-control broadcast level pps 3000 1500
+ storm-control multicast level pps 3000 1500

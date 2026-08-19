@@ -1,0 +1,115 @@
+# ============================================================
+#  OpenSSL Root CA 設定檔
+#  適用：Windows 7 x64 + OpenSSL（離線 Root CA）
+#  CA 有效期：25 年
+#  CRL 有效期：1 年（每年上線更新一次）
+# ============================================================
+
+[ ca ]
+default_ca = CA_default
+
+# ── CA 核心設定 ───────────────────────────────────────────────
+[ CA_default ]
+dir               = C:/RootCA                    # ← CA 工作根目錄
+certs             = $dir/certs                   # 已簽發憑證存放
+crl_dir           = $dir/crl                     # CRL 存放目錄
+database          = $dir/db/index.txt            # 憑證資料庫
+new_certs_dir     = $dir/newcerts                # 新簽發憑證備份
+certificate       = $dir/rootCA.crt              # Root CA 憑證
+private_key       = $dir/private/rootCA.key      # Root CA 私鑰（務必保護）
+serial            = $dir/db/serial               # 憑證序號檔
+crlnumber         = $dir/db/crlnumber            # CRL 序號檔
+crl               = $dir/crl/rootCA.crl          # 目前 CRL 輸出路徑
+RANDFILE          = $dir/private/.rand
+
+# ── 簽章演算法 ────────────────────────────────────────────────
+default_md        = sha256
+
+# ── 憑證與 CRL 預設有效期 ─────────────────────────────────────
+default_days      = 1825                         # 子憑證預設 5 年
+default_crl_days  = 365                          # CRL 有效期 1 年
+
+# ── 原則：Root CA 只簽 Intermediate CA，欄位須完全吻合 ────────
+policy            = policy_strict
+email_in_dn       = no
+copy_extensions   = none
+unique_subject    = yes
+
+[ policy_strict ]
+countryName             = match                  # 必須與 Root CA 相同
+stateOrProvinceName     = optional
+organizationName        = supplied                  # 必須與 Root CA 相同
+organizationalUnitName  = optional
+commonName              = supplied               # 必填
+emailAddress            = optional
+
+# ── 寬鬆原則（保留供日後 Intermediate CA 用） ─────────────────
+[ policy_loose ]
+countryName             = optional
+stateOrProvinceName     = optional
+localityName            = optional
+organizationName        = optional
+organizationalUnitName  = optional
+commonName              = supplied
+emailAddress            = optional
+
+# ── 預設 CSR 要求設定 ─────────────────────────────────────────
+[ req ]
+default_bits        = 4096
+default_keyfile     = privkey.pem
+distinguished_name  = req_distinguished_name
+string_mask         = utf8only
+default_md          = sha256
+x509_extensions     = v3_root_ca                 # 自簽時套用 Root CA 擴充
+
+[ req_distinguished_name ]
+countryName                     = Country Name (2 letter code)
+countryName_default             = TW
+countryName_min                 = 2
+countryName_max                 = 2
+
+stateOrProvinceName             = State or Province Name
+stateOrProvinceName_default     = Taiwan
+
+localityName                    = Locality Name
+localityName_default            = Taipei
+
+organizationName                = Organization Name
+organizationName_default        = MyOrg Ltd
+
+organizationalUnitName          = Organizational Unit Name
+organizationalUnitName_default  = IT Department
+
+commonName                      = Common Name
+commonName_default              = MyOrg Root CA
+commonName_max                  = 64
+
+# ── Root CA 憑證擴充欄位 ──────────────────────────────────────
+[ v3_root_ca ]
+subjectKeyIdentifier    = hash
+authorityKeyIdentifier  = keyid:always, issuer
+basicConstraints        = critical, CA:true                  # 這是 CA 憑證
+keyUsage                = critical, keyCertSign, cRLSign     # 只能簽憑證與 CRL
+# pathlen:1 表示最多允許一層 Intermediate CA
+# basicConstraints      = critical, CA:true, pathlen:1       # 視需要啟用
+
+# ── Intermediate CA 憑證擴充欄位 ─────────────────────────────
+[ v3_intermediate_ca ]
+subjectKeyIdentifier    = hash
+authorityKeyIdentifier  = keyid:always, issuer
+basicConstraints        = critical, CA:true, pathlen:0       # 不可再簽下層 CA
+keyUsage                = critical, keyCertSign, cRLSign
+# CRL Distribution Point：填入 Root CA 發布 CRL 的 URL
+crlDistributionPoints = URI:http://crl.corp.foo.bar.tw/rootca.crl
+
+# ── CRL 擴充欄位 ──────────────────────────────────────────────
+[ crl_ext ]
+authorityKeyIdentifier  = keyid:always
+
+# ── OCSP 擴充（選用） ────────────────────────────────────────
+[ ocsp ]
+basicConstraints        = CA:FALSE
+subjectKeyIdentifier    = hash
+authorityKeyIdentifier  = keyid, issuer
+keyUsage                = critical, digitalSignature
+extendedKeyUsage        = critical, OCSPSigning
