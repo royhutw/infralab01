@@ -22,6 +22,18 @@
 #        Windows FILETIME 格式使用小端序（Little-Endian），
 #        移除錯誤的 [Array]::Reverse() 呼叫，確保有效期正確寫入
 #
+#    v4（本次修正）：
+#      發現 AD CS 憑證範本強制規定「更新期(Overlap Period)不得超過
+#      有效期的75%」，原 v3 使用的80%比例（Computer:292天／
+#      User,NPS:584天）會導致 MMC 編輯範本時跳出錯誤：
+#        "The renewal period (X days) is larger than the maximum
+#         allowed. ... maximum allowed (Y hours)"
+#      實測跳出的上限數字（Computer:6570小時／User,NPS:13140小時）
+#      換算回天數剛好等於有效期的75%，證實此為AD CS的硬性規則，
+#      非僅MMC介面提示，已將三個範本的更新期比例統一修正為75%：
+#        Computer：365天 × 75% = 273.75天（6570小時）
+#        User/NPS：730天 × 75% = 547.5天（13140小時）
+#
 #    v3（本次修正，重要，含安全性修正）：
 #      1. 【安全性修正】EAP-TLS-User 範本的 msPKI-Certificate-Name-Flag
 #         原設定為 0x02000001，其中 0x00000001 依 MS-CRTD 官方規格
@@ -39,6 +51,15 @@
 #         加入網域的電腦都嘗試自動申請 NPS 伺服器憑證，範圍過廣。
 #         已改為建立專屬安全群組（NPS-Servers），僅將實際 NPS 伺服器的
 #         電腦帳號加入此群組，並僅授權此群組 Enroll/Autoenroll。
+#
+#    v4（本次修正）：
+#      經實機在 MMC 編輯範本時實測發現，Windows CA 強制要求
+#      Renewal Period（更新期）不得超過 Validity Period（有效期）的
+#      75%，超過會跳出「renewal period is larger than the maximum
+#      allowed」警告。舊版腳本誤用 80% 計算三個範本的 Renewal Ticks，
+#      已全數修正為 75%：
+#        - Computer：292 天 → 273.75 天（6,570 小時）
+#        - User / NPS：584 天 → 547.5 天（13,140 小時）
 # ============================================================
 
 #region ── 參數區（請依實際環境修改） ────────────────────────
@@ -82,19 +103,28 @@ $Params = @{
     #   365 × 24 × 3600 × 10000000 = 315,360,000,000,000
     ComputerValidityTicks   = [long]-315360000000000
 
-    # Computer Renewal：有效期 80% = 292 天
-    #   292 × 24 × 3600 × 10000000 = 252,288,000,000,000
-    ComputerRenewalTicks    = [long]-252288000000000
+    # ── Renewal Period 上限說明（本次修正，重要）───────────
+    #
+    #  實測發現：透過 MMC 編輯範本時，Windows CA 會強制要求
+    #  Renewal Period 不得超過 Validity Period 的 75%，超過會
+    #  跳出警告「renewal period is larger than the maximum
+    #  allowed」，並提示自動改為上限值。
+    #
+    #  舊版腳本誤用 80% 計算 Renewal，超過此上限，已修正為 75%。
+    #
+    #  Computer Renewal：有效期 75% = 273.75 天 = 6,570 小時
+    #    6570 × 3600 × 10000000 = 236,520,000,000,000
+    ComputerRenewalTicks    = [long]-236520000000000
 
     # User / NPS：2 年 = 730 天
     #   730 × 24 × 3600 × 10000000 = 630,720,000,000,000
     UserValidityTicks       = [long]-630720000000000
     NPSValidityTicks        = [long]-630720000000000
 
-    # User / NPS Renewal：有效期 80% = 584 天
-    #   584 × 24 × 3600 × 10000000 = 504,576,000,000,000
-    UserRenewalTicks        = [long]-504576000000000
-    NPSRenewalTicks         = [long]-504576000000000
+    # User / NPS Renewal：有效期 75% = 547.5 天 = 13,140 小時
+    #   13140 × 3600 × 10000000 = 473,040,000,000,000
+    UserRenewalTicks        = [long]-473040000000000
+    NPSRenewalTicks         = [long]-473040000000000
 }
 #endregion
 
@@ -106,7 +136,7 @@ if (-not (Get-Module -ListAvailable -Name ActiveDirectory)) {
 
 Write-Host ""
 Write-Host "=================================================="  -ForegroundColor Cyan
-Write-Host "  建立 802.1x EAP-TLS 憑證範本 v3"                  -ForegroundColor Cyan
+Write-Host "  建立 802.1x EAP-TLS 憑證範本 v4"                  -ForegroundColor Cyan
 Write-Host "=================================================="  -ForegroundColor Cyan
 Write-Host ""
 
@@ -444,12 +474,13 @@ Write-Host "[確認] 驗證範本屬性..." -ForegroundColor Yellow
 $AllExist = $true
 
 @(
-    @{ Name = $Params.ComputerTemplateName; ExpectDays = 365 },
-    @{ Name = $Params.UserTemplateName;     ExpectDays = 730 },
-    @{ Name = $Params.NPSTemplateName;      ExpectDays = 730 }
+    @{ Name = $Params.ComputerTemplateName; ExpectDays = 365; ExpectRenewDays = 273.75 },
+    @{ Name = $Params.UserTemplateName;     ExpectDays = 730; ExpectRenewDays = 547.5 },
+    @{ Name = $Params.NPSTemplateName;      ExpectDays = 730; ExpectRenewDays = 547.5 }
 ) | ForEach-Object {
-    $TemplateName = $_.Name
-    $ExpectDays   = $_.ExpectDays
+    $TemplateName    = $_.Name
+    $ExpectDays      = $_.ExpectDays
+    $ExpectRenewDays = $_.ExpectRenewDays
     $DN  = "CN=$TemplateName,$TemplateBaseDN"
     $Obj = Get-ADObject -Filter { distinguishedName -eq $DN } `
                -SearchBase $TemplateBaseDN `
@@ -466,13 +497,19 @@ $AllExist = $true
         Write-Host ""
         Write-Host "  [$TemplateName]" -ForegroundColor Cyan
         Write-Host "    有效期       ：$ActualDays 天（預期 $ExpectDays 天）" -ForegroundColor $(if ($ActualDays -eq $ExpectDays) {'Green'} else {'Red'})
-        Write-Host "    更新期       ：$ActualRenew 天前開始更新" -ForegroundColor Gray
+        $RenewRatio = [Math]::Round(($ActualRenew / $ActualDays) * 100, 1)
+        Write-Host "    更新期       ：$ActualRenew 天前開始更新（佔有效期 $RenewRatio%）" -ForegroundColor $(if ($RenewRatio -le 75) {'Gray'} else {'Red'})
         Write-Host "    最小金鑰長度 ：$($Obj.'msPKI-Minimal-Key-Size') bits" -ForegroundColor Gray
         Write-Host "    申請旗標     ：0x$($Obj.'msPKI-Enrollment-Flag'.ToString('X'))" -ForegroundColor Gray
         Write-Host "    主體名稱旗標 ：0x$($Obj.'msPKI-Certificate-Name-Flag'.ToString('X'))" -ForegroundColor Gray
 
         if ($ActualDays -ne $ExpectDays) {
             Write-Host "    [ERROR] 有效期與預期不符！" -ForegroundColor Red
+            $AllExist = $false
+        }
+
+        if ($RenewRatio -gt 75) {
+            Write-Host "    [ERROR] Renewal Period 超過 CA 允許的 75% 上限，MMC編輯時會被強制修正！請檢查 Ticks 計算。" -ForegroundColor Red
             $AllExist = $false
         }
 
@@ -649,12 +686,12 @@ certutil -config $CAConfig -catemplates
 Write-Host @"
 
 ==================================================
-  憑證範本建立完成！（v3，含安全性修正）
+  憑證範本建立完成！（v4，含安全性修正 + Renewal上限修正）
   已建立範本：
-    - $($Params.ComputerTemplateName)（1 年，電腦 Auto-Enrollment，範圍：Domain Computers）
-    - $($Params.UserTemplateName)（2 年，使用者 Auto-Enrollment，範圍：Domain Users）
+    - $($Params.ComputerTemplateName)（1 年，Renewal 273.75 天/6570小時，電腦 Auto-Enrollment，範圍：Domain Computers）
+    - $($Params.UserTemplateName)（2 年，Renewal 547.5 天/13140小時，使用者 Auto-Enrollment，範圍：Domain Users）
       → NameFlag 已修正為 0x42000000，Subject/SAN 一律由 CA 依 AD 資訊建構
-    - $($Params.NPSTemplateName)（2 年，NPS 伺服器，範圍：$($Params.NPSServersGroupName) 群組）
+    - $($Params.NPSTemplateName)（2 年，Renewal 547.5 天/13140小時，NPS 伺服器，範圍：$($Params.NPSServersGroupName) 群組）
       → 已限縮權限，僅群組成員可申請，不再開放給所有網域電腦
 
   【重要提醒】若此前已使用舊版 v2 腳本建立過範本並已核發憑證：
@@ -671,7 +708,9 @@ Write-Host @"
     certtmpl.msc
     → 右鍵範本 → Properties
     → Validity Period 應顯示 1 year / 2 years
-    → Renewal Period 應顯示 292 days / 584 days
+    → Renewal Period 應顯示 273 days（或270 days，MMC可能取整） / 547 days
+      （若MMC因單位換算再次跳出「超過上限」提示，屬正常的取整誤差，
+        直接點擊OK採用CA建議的自動修正值即可）
 
   驗證 User 範本 Subject Name 頁籤（重要）：
     → 應勾選「Build from this Active Directory information」
