@@ -21,6 +21,24 @@
 #    v2：修正 pKIExpirationPeriod / pKIOverlapPeriod Bytes 端序問題
 #        Windows FILETIME 格式使用小端序（Little-Endian），
 #        移除錯誤的 [Array]::Reverse() 呼叫，確保有效期正確寫入
+#
+#    v3（本次修正，重要，含安全性修正）：
+#      1. 【安全性修正】EAP-TLS-User 範本的 msPKI-Certificate-Name-Flag
+#         原設定為 0x02000001，其中 0x00000001 依 MS-CRTD 官方規格
+#         實際上是 CT_FLAG_ENROLLEE_SUPPLIES_SUBJECT（讓申請端自行指定
+#         Subject），而非原註解誤植的「CT_FLAG_SUBJECT_REQUIRE_COMMON_NAME」。
+#         此設定搭配 Client Authentication EKU 且開放 Domain Users
+#         Enroll 權限，構成 AD CS 已知的 ESC1 提權漏洞條件（任何網域使用者
+#         皆可能自行指定憑證 Subject/SAN，偽裝成其他帳號）。
+#         已修正為正確值 0x42000000（CT_FLAG_SUBJECT_REQUIRE_COMMON_NAME
+#         + CT_FLAG_SUBJECT_ALT_REQUIRE_UPN）。
+#      2. 修正 Computer / NPS 範本註解中的位元名稱標示錯誤（實際套用數值
+#         0x18000000 本身正確，僅註解對照表寫錯，一併修正說明文字）。
+#      3. 【最小權限修正】EAP-TLS-NPS-Server 範本的 Enroll/Autoenroll權限，
+#         原設定授予 'Domain Computers'（網域所有電腦帳號），會導致所有
+#         加入網域的電腦都嘗試自動申請 NPS 伺服器憑證，範圍過廣。
+#         已改為建立專屬安全群組（NPS-Servers），僅將實際 NPS 伺服器的
+#         電腦帳號加入此群組，並僅授權此群組 Enroll/Autoenroll。
 # ============================================================
 
 #region ── 參數區（請依實際環境修改） ────────────────────────
@@ -43,6 +61,12 @@ $Params = @{
 
     # ── 金鑰設定 ─────────────────────────────────────────────
     KeyLength               = 4096
+
+    # ── NPS 伺服器專屬安全群組（本次新增，用於最小權限控管）──
+    #  請將實際兩台 NPS 伺服器的「電腦帳號名稱」填入下方陣列
+    #  （AD Computer Name，不含網域尾碼、不含結尾的 $ 符號）
+    NPSServersGroupName     = 'NPS-Servers'
+    NPSServerComputerNames  = @('NPS01', 'NPS02')   # ← 請依實際主機名稱修改
 
     # ── 憑證有效期（Windows FILETIME 負值，單位：100 奈秒）──
     #
@@ -82,7 +106,7 @@ if (-not (Get-Module -ListAvailable -Name ActiveDirectory)) {
 
 Write-Host ""
 Write-Host "=================================================="  -ForegroundColor Cyan
-Write-Host "  建立 802.1x EAP-TLS 憑證範本 v2"                  -ForegroundColor Cyan
+Write-Host "  建立 802.1x EAP-TLS 憑證範本 v3"                  -ForegroundColor Cyan
 Write-Host "=================================================="  -ForegroundColor Cyan
 Write-Host ""
 
@@ -306,9 +330,15 @@ function Copy-CertificateTemplate {
 #  EKU：
 #    1.3.6.1.5.5.7.3.2 = Client Authentication（必要）
 #
-#  主體名稱旗標（msPKI-Certificate-Name-Flag）：
-#    0x00000008 = CT_FLAG_SUBJECT_ALT_REQUIRE_DNS
-#    SAN 包含電腦的 FQDN（如 pc01.corp.foo.bar.tw）
+#  主體名稱旗標（msPKI-Certificate-Name-Flag，依MS-CRTD官方規格）：
+#    0x08000000 = CT_FLAG_SUBJECT_ALT_REQUIRE_DNS
+#                 （CA 依申請者電腦物件的 dNSHostName 屬性，
+#                   將 FQDN 加入 Subject Alternative Name）
+#    0x10000000 = CT_FLAG_SUBJECT_REQUIRE_DNS_AS_CN
+#                 （Subject 的 CN 同樣採用 DNS 名稱）
+#    合計 = 0x18000000
+#
+#  （此數值本身正確，僅原註解誤標位元名稱，已於本版修正說明文字）
 #
 #  申請旗標：
 #    0x20 = CT_FLAG_AUTO_ENROLLMENT（Auto-Enrollment）
@@ -336,10 +366,23 @@ Copy-CertificateTemplate `
 #  EKU：
 #    1.3.6.1.5.5.7.3.2 = Client Authentication（必要）
 #
-#  主體名稱旗標（msPKI-Certificate-Name-Flag）：
-#    0x00000001 = CT_FLAG_SUBJECT_REQUIRE_COMMON_NAME（CN = 帳號名稱）
-#    0x02000000 = CT_FLAG_SUBJECT_ALT_REQUIRE_UPN（SAN 包含 UPN）
-#    合計 = 0x02000001
+#  主體名稱旗標（msPKI-Certificate-Name-Flag，依MS-CRTD官方規格）：
+#    0x40000000 = CT_FLAG_SUBJECT_REQUIRE_COMMON_NAME
+#                 （CN 由 CA 依申請者 AD 物件建構，而非申請端自行提供）
+#    0x02000000 = CT_FLAG_SUBJECT_ALT_REQUIRE_UPN
+#                 （CA 依申請者 AD 物件的 userPrincipalName 屬性，
+#                   將 UPN 加入 Subject Alternative Name，供 NPS 比對）
+#    合計 = 0x42000000
+#
+#  【重要安全性修正】
+#    舊版誤用 0x02000001，其中 0x00000001 依官方規格實際上是
+#    CT_FLAG_ENROLLEE_SUPPLIES_SUBJECT（允許申請端自行指定 Subject），
+#    而非「要求 Common Name」。此設定搭配 Client Authentication EKU
+#    且開放 Domain Users 廣泛 Enroll 權限，構成 AD CS 已知的
+#    ESC1 提權漏洞條件，任何網域使用者理論上可自行指定憑證 Subject/SAN，
+#    偽裝成其他帳號身份。已修正為正確值 0x42000000，
+#    確保 Subject/SAN 一律由 CA 依申請者本人的 AD 物件建構，
+#    不允許申請端自行指定。
 #
 Write-Host ""
 Write-Host "[2/3] 建立 EAP-TLS-User 範本（有效期 2 年）..." -ForegroundColor Yellow
@@ -353,7 +396,7 @@ Copy-CertificateTemplate `
     -KeyLength          $Params.KeyLength `
     -EKUList            @('1.3.6.1.5.5.7.3.2') `
     -EnrollmentFlag     0x00 `
-    -NameFlag           0x02000001 `
+    -NameFlag           0x42000000 `
     -AutoEnroll         $true
 
 # ════════════════════════════════════════════════════════════
@@ -367,9 +410,13 @@ Copy-CertificateTemplate `
 #    1.3.6.1.5.5.7.3.1 = Server Authentication（NPS 必要）
 #    1.3.6.1.5.5.7.3.2 = Client Authentication（部分情境需要）
 #
-#  主體名稱旗標（msPKI-Certificate-Name-Flag）：
-#    0x00000008 = CT_FLAG_SUBJECT_ALT_REQUIRE_DNS
-#    SAN 包含 NPS 伺服器的 FQDN（如 nps.corp.foo.bar.tw）
+#  主體名稱旗標（msPKI-Certificate-Name-Flag，依MS-CRTD官方規格）：
+#    0x08000000 = CT_FLAG_SUBJECT_ALT_REQUIRE_DNS
+#    0x10000000 = CT_FLAG_SUBJECT_REQUIRE_DNS_AS_CN
+#    合計 = 0x18000000
+#    SAN 包含 NPS 伺服器的 FQDN（如 nps01.corp.foo.bar.tw）
+#
+#  （此數值本身正確，僅原註解誤標位元名稱，已於本版修正說明文字）
 #
 Write-Host ""
 Write-Host "[3/3] 建立 EAP-TLS-NPS-Server 範本（有效期 2 年）..." -ForegroundColor Yellow
@@ -406,7 +453,7 @@ $AllExist = $true
     $DN  = "CN=$TemplateName,$TemplateBaseDN"
     $Obj = Get-ADObject -Filter { distinguishedName -eq $DN } `
                -SearchBase $TemplateBaseDN `
-               -Properties 'pKIExpirationPeriod','pKIOverlapPeriod','msPKI-Minimal-Key-Size','msPKI-Enrollment-Flag' `
+               -Properties 'pKIExpirationPeriod','pKIOverlapPeriod','msPKI-Minimal-Key-Size','msPKI-Enrollment-Flag','msPKI-Certificate-Name-Flag' `
                -ErrorAction SilentlyContinue
 
     if ($Obj) {
@@ -422,10 +469,22 @@ $AllExist = $true
         Write-Host "    更新期       ：$ActualRenew 天前開始更新" -ForegroundColor Gray
         Write-Host "    最小金鑰長度 ：$($Obj.'msPKI-Minimal-Key-Size') bits" -ForegroundColor Gray
         Write-Host "    申請旗標     ：0x$($Obj.'msPKI-Enrollment-Flag'.ToString('X'))" -ForegroundColor Gray
+        Write-Host "    主體名稱旗標 ：0x$($Obj.'msPKI-Certificate-Name-Flag'.ToString('X'))" -ForegroundColor Gray
 
         if ($ActualDays -ne $ExpectDays) {
             Write-Host "    [ERROR] 有效期與預期不符！" -ForegroundColor Red
             $AllExist = $false
+        }
+
+        # ── 額外檢查：確認 User 範本沒有殘留危險的 ENROLLEE_SUPPLIES_SUBJECT 旗標
+        if ($TemplateName -eq $Params.UserTemplateName) {
+            $NameFlagValue = [int]$Obj.'msPKI-Certificate-Name-Flag'
+            if ($NameFlagValue -band 0x00000001) {
+                Write-Host "    [ERROR] 偵測到 CT_FLAG_ENROLLEE_SUPPLIES_SUBJECT 仍被設定！這是安全性風險，請立即檢查！" -ForegroundColor Red
+                $AllExist = $false
+            } else {
+                Write-Host "    [OK] 未偵測到 ENROLLEE_SUPPLIES_SUBJECT 旗標，Subject 由 CA 依 AD 資訊建構。" -ForegroundColor Green
+            }
         }
     } else {
         Write-Host "  [ERROR] 找不到範本：$TemplateName" -ForegroundColor Red
@@ -461,6 +520,54 @@ if ($LASTEXITCODE -ne 0) {
     @($Params.ComputerTemplateName, $Params.UserTemplateName, $Params.NPSTemplateName) |
         ForEach-Object { Write-Host "      [OK] 已發布：$_" -ForegroundColor Green }
 }
+
+# ════════════════════════════════════════════════════════════
+#  建立 NPS 伺服器專屬安全群組（本次新增，最小權限控管）
+# ════════════════════════════════════════════════════════════
+#
+#  目的：EAP-TLS-NPS-Server 範本僅應由實際的 NPS 伺服器申請，
+#        不應開放給 Domain Computers（所有網域電腦）。
+#        建立專屬群組，僅將實際 NPS 伺服器的電腦帳號加入，
+#        後續範本 ACL 僅授權此群組。
+#
+Write-Host ""
+Write-Host "[群組] 建立 NPS 伺服器專屬安全群組..." -ForegroundColor Yellow
+
+$ExistingGroup = Get-ADGroup -Filter "Name -eq '$($Params.NPSServersGroupName)'" -ErrorAction SilentlyContinue
+if ($null -eq $ExistingGroup) {
+    New-ADGroup -Name $Params.NPSServersGroupName `
+                -SamAccountName $Params.NPSServersGroupName `
+                -GroupCategory Security `
+                -GroupScope Global `
+                -Description 'NPS RADIUS 伺服器電腦帳號 - 僅此群組可申請 EAP-TLS-NPS-Server 憑證' `
+                -ErrorAction Stop
+    Write-Host "      [OK] 群組已建立：$($Params.NPSServersGroupName)" -ForegroundColor Green
+} else {
+    Write-Host "      [SKIP] 群組已存在：$($Params.NPSServersGroupName)" -ForegroundColor Yellow
+}
+
+foreach ($ComputerName in $Params.NPSServerComputerNames) {
+    try {
+        $ComputerObj = Get-ADComputer -Identity $ComputerName -ErrorAction Stop
+        $IsMember = Get-ADGroupMember -Identity $Params.NPSServersGroupName -ErrorAction SilentlyContinue |
+                        Where-Object { $_.SamAccountName -eq $ComputerObj.SamAccountName }
+        if ($null -eq $IsMember) {
+            Add-ADGroupMember -Identity $Params.NPSServersGroupName -Members $ComputerObj -ErrorAction Stop
+            Write-Host "      [OK] 已加入群組：$ComputerName" -ForegroundColor Green
+        } else {
+            Write-Host "      [SKIP] 已是群組成員：$ComputerName" -ForegroundColor Yellow
+        }
+    }
+    catch {
+        Write-Host "      [ERROR] 找不到電腦帳號或加入失敗：$ComputerName - $($_.Exception.Message)" -ForegroundColor Red
+        Write-Host "      [提醒] 請確認 `$Params.NPSServerComputerNames` 內的名稱與實際 AD 電腦帳號名稱相符" -ForegroundColor Yellow
+    }
+}
+
+# ── 等待 AD 複寫（群組成員異動需要時間生效）───────────────────
+Write-Host ""
+Write-Host "[等待] 等待 AD 群組成員複寫完成（5 秒）..." -ForegroundColor Yellow
+Start-Sleep -Seconds 5
 
 # ── 設定範本 ACL ─────────────────────────────────────────────
 Write-Host ""
@@ -515,6 +622,7 @@ function Set-TemplateACL {
 }
 
 # Computer 範本：Domain Computers → Enroll + Auto-Enroll
+# （此範本設計上就是要給所有網域電腦做802.1x機器認證用，Domain Computers 是正確範圍）
 Set-TemplateACL -TemplateName  $Params.ComputerTemplateName `
                 -PrincipalName 'Domain Computers' `
                 -DomainName    $Params.DomainName
@@ -526,11 +634,12 @@ Set-TemplateACL -TemplateName  $Params.UserTemplateName `
                 -DomainName    $Params.DomainName
 Write-Host "      [OK] $($Params.UserTemplateName)：Domain Users → Read + Enroll + Auto-Enroll" -ForegroundColor Green
 
-# NPS 範本：Domain Computers → Enroll（NPS 伺服器以電腦帳號申請）
+# NPS 範本：僅授權 NPS-Servers 專屬群組（最小權限修正，取代原本的 Domain Computers）
 Set-TemplateACL -TemplateName  $Params.NPSTemplateName `
-                -PrincipalName 'Domain Computers' `
+                -PrincipalName $Params.NPSServersGroupName `
                 -DomainName    $Params.DomainName
-Write-Host "      [OK] $($Params.NPSTemplateName)：Domain Computers → Read + Enroll + Auto-Enroll" -ForegroundColor Green
+Write-Host "      [OK] $($Params.NPSTemplateName)：$($Params.NPSServersGroupName) → Read + Enroll + Auto-Enroll" -ForegroundColor Green
+Write-Host "      [安全性修正] NPS範本已改為僅授權專屬群組，不再開放給 Domain Computers" -ForegroundColor Cyan
 
 # ── 最終確認：CA 已發布的範本清單 ────────────────────────────
 Write-Host ""
@@ -540,11 +649,20 @@ certutil -config $CAConfig -catemplates
 Write-Host @"
 
 ==================================================
-  憑證範本建立完成！
+  憑證範本建立完成！（v3，含安全性修正）
   已建立範本：
-    - $($Params.ComputerTemplateName)（1 年，電腦 Auto-Enrollment）
-    - $($Params.UserTemplateName)（2 年，使用者 Auto-Enrollment）
-    - $($Params.NPSTemplateName)（2 年，NPS 伺服器）
+    - $($Params.ComputerTemplateName)（1 年，電腦 Auto-Enrollment，範圍：Domain Computers）
+    - $($Params.UserTemplateName)（2 年，使用者 Auto-Enrollment，範圍：Domain Users）
+      → NameFlag 已修正為 0x42000000，Subject/SAN 一律由 CA 依 AD 資訊建構
+    - $($Params.NPSTemplateName)（2 年，NPS 伺服器，範圍：$($Params.NPSServersGroupName) 群組）
+      → 已限縮權限，僅群組成員可申請，不再開放給所有網域電腦
+
+  【重要提醒】若此前已使用舊版 v2 腳本建立過範本並已核發憑證：
+    1. 請確認是否已有使用者透過舊版 EAP-TLS-User 範本取得憑證
+    2. 建議至 CA「Issued Certificates」檢視該期間核發的憑證 Subject/SAN 是否異常
+    3. 撤銷舊憑證，待範本修正後透過 Autoenrollment 重新核發
+    4. 若先前已將 Domain Computers 加入 NPS 範本 ACL 且已有非 NPS 伺服器的電腦
+       取得該憑證，建議一併檢視 CA 核發記錄並考慮撤銷不必要的憑證
 
   若 MMC 中看不到範本，請在 AD CS MMC 中：
     Certificate Templates → 右鍵 → Refresh
@@ -554,6 +672,12 @@ Write-Host @"
     → 右鍵範本 → Properties
     → Validity Period 應顯示 1 year / 2 years
     → Renewal Period 應顯示 292 days / 584 days
+
+  驗證 User 範本 Subject Name 頁籤（重要）：
+    → 應勾選「Build from this Active Directory information」
+    → Subject name format 應顯示「Common name」
+    → 「Include this information in alternate subject name」下
+      「User principal name (UPN)」應為勾選狀態
 
   下一步：執行 05_configure_autoenrollment_gpo.ps1 設定 GPO
 ==================================================
