@@ -60,6 +60,18 @@
 #      已全數修正為 75%：
 #        - Computer：292 天 → 273.75 天（6,570 小時）
 #        - User / NPS：584 天 → 547.5 天（13,140 小時）
+#
+#    v5（本次修正，重要，解釋「User憑證核發給電腦」的根本原因）：
+#      經比對 MS-WCCE 官方規格 3.2.2.6.2.1.4.4.1 節，發現舊版三個範本
+#      共用寫死的 flags = 131680（= 0x20260，而非原註解誤植的
+#      0x00022260），其中包含 CT_FLAG_MACHINE_TYPE（0x40）位元。
+#      此位元若出現在 EAP-TLS-User 範本上，依官方規格，CA 會被強制
+#      要求改用「申請者的電腦物件」之 dNSHostName 屬性建構 Subject，
+#      而非使用者物件——這正是「User憑證核發給電腦」此症狀的根本原因。
+#      已將 Copy-CertificateTemplate 函式改為依 -IsMachineType 參數
+#      動態計算 flags：Computer / NPS-Server 範本保留 MACHINE_TYPE
+#      （這兩者本應為電腦類型範本），User 範本則移除此位元。
+#      同時新增自動驗證，建立範本後會檢查各範本的 flags 是否正確。
 # ============================================================
 
 #region ── 參數區（請依實際環境修改） ────────────────────────
@@ -87,7 +99,7 @@ $Params = @{
     #  請將實際兩台 NPS 伺服器的「電腦帳號名稱」填入下方陣列
     #  （AD Computer Name，不含網域尾碼、不含結尾的 $ 符號）
     NPSServersGroupName     = 'NPS-Servers'
-    NPSServerComputerNames  = @('NPS01', 'NPS02')   # ← 請依實際主機名稱修改
+    NPSServerComputerNames  = @('RADIUS1')   # ← 目前僅一台NPS伺服器，日後新增第二台請把主機名稱加進此陣列
 
     # ── 憑證有效期（Windows FILETIME 負值，單位：100 奈秒）──
     #
@@ -136,7 +148,7 @@ if (-not (Get-Module -ListAvailable -Name ActiveDirectory)) {
 
 Write-Host ""
 Write-Host "=================================================="  -ForegroundColor Cyan
-Write-Host "  建立 802.1x EAP-TLS 憑證範本 v4"                  -ForegroundColor Cyan
+Write-Host "  建立 802.1x EAP-TLS 憑證範本 v5"                  -ForegroundColor Cyan
 Write-Host "=================================================="  -ForegroundColor Cyan
 Write-Host ""
 
@@ -186,7 +198,8 @@ function Copy-CertificateTemplate {
         [array]  $EKUList,              # 延伸金鑰用途 OID 清單
         [int]    $EnrollmentFlag,       # 申請旗標
         [int]    $NameFlag,             # 主體名稱旗標
-        [bool]   $AutoEnroll = $true    # 是否啟用 Auto-Enrollment
+        [bool]   $AutoEnroll = $true,   # 是否啟用 Auto-Enrollment
+        [bool]   $IsMachineType = $false # 是否為「電腦類型」範本（重要，見下方flags說明）
     )
 
     Write-Host "  處理範本：$NewDisplayName" -ForegroundColor Gray
@@ -245,6 +258,34 @@ function Copy-CertificateTemplate {
     $NewOIDSuffix = Get-Random -Minimum 1000000 -Maximum 9999999
     $NewOID       = "$SourceOID.$NewOIDSuffix"
 
+    # ── flags 屬性計算（本次修正，重要）───────────────────────
+    #
+    #  舊版錯誤：三個範本共用寫死的 131680（0x20260），其中包含
+    #  CT_FLAG_MACHINE_TYPE（0x40）位元。這個位元若出現在「使用者」
+    #  類型範本上，依 MS-WCCE 官方規格 3.2.2.6.2.1.4.4.1 節規定：
+    #    「當 CT_FLAG_MACHINE_TYPE 被設定，且 msPKI-Certificate-Name-Flag
+    #     裡的 CT_FLAG_ENROLLEE_SUPPLIES_SUBJECT 未設定，且
+    #     CT_FLAG_SUBJECT_REQUIRE_COMMON_NAME（或類似位元）有設定時，
+    #     CA 必須改用「申請者的電腦物件」之 dNSHostName 屬性建構Subject，
+    #     若找不到對應電腦物件則直接拒絕請求。」
+    #  這正是導致 EAP-TLS-User 範本核發出「電腦身份」憑證的根本原因。
+    #
+    #  正確做法：僅電腦/伺服器類型範本（Computer、NPS-Server）需要
+    #  CT_FLAG_MACHINE_TYPE，使用者類型範本（User）不可包含此位元。
+    #
+    #  基礎位元（不含MACHINE_TYPE）：
+    #    0x00000020 = CT_FLAG_AUTO_ENROLLMENT
+    #    0x00000200 = CT_FLAG_ADD_TEMPLATE_NAME
+    #    0x00020000 = CT_FLAG_IS_MODIFIED
+    #    合計 = 131616（0x20260 減去 0x40）
+    #
+    $BaseFlags  = 0x00000020 -bor 0x00000200 -bor 0x00020000   # 131616
+    $FinalFlags = if ($IsMachineType) {
+        $BaseFlags -bor 0x00000040   # 加入 CT_FLAG_MACHINE_TYPE（Computer / NPS-Server 專用）
+    } else {
+        $BaseFlags                   # User 範本：絕不可加入 MACHINE_TYPE
+    }
+
     # ── 建立新範本的 AD 屬性集合 ─────────────────────────────
     $NewAttributes = @{
 
@@ -252,12 +293,8 @@ function Copy-CertificateTemplate {
         'displayName'   = $NewDisplayName
         'revision'      = '100'
 
-        # flags 旗標說明：
-        #   0x00000020 = CT_FLAG_AUTO_ENROLLMENT（允許 Auto-Enrollment）
-        #   0x00000040 = CT_FLAG_MACHINE_TYPE（電腦類型範本）
-        #   0x00020000 = CT_FLAG_IS_DEFAULT（預設範本）
-        #   131680 = 0x00022260（IS_CA + PUBLISH_TO_DS + ADD_TEMPLATE_NAME）
-        'flags'         = [int]131680
+        # flags 旗標說明（依 IsMachineType 動態計算，見上方註解）：
+        'flags'         = [int]$FinalFlags
 
         # ── OID（必須唯一，CA 透過此欄位識別範本）───────────
         'msPKI-Cert-Template-OID' = $NewOID
@@ -385,7 +422,8 @@ Copy-CertificateTemplate `
     -EKUList            @('1.3.6.1.5.5.7.3.2') `
     -EnrollmentFlag     0x00 `
     -NameFlag           0x18000000 `
-    -AutoEnroll         $true
+    -AutoEnroll         $true `
+    -IsMachineType      $true
 
 # ════════════════════════════════════════════════════════════
 #  建立範本二：EAP-TLS-User（使用者憑證，有效期 2 年）
@@ -414,6 +452,11 @@ Copy-CertificateTemplate `
 #    確保 Subject/SAN 一律由 CA 依申請者本人的 AD 物件建構，
 #    不允許申請端自行指定。
 #
+#  【極重要】IsMachineType 必須為 $false！
+#    這是修正症狀「User憑證核發給電腦」的關鍵——絕不可讓此範本的
+#    flags 屬性包含 CT_FLAG_MACHINE_TYPE，否則 CA 會依規定改用
+#    申請者的電腦物件建構 Subject，而非使用者物件。
+#
 Write-Host ""
 Write-Host "[2/3] 建立 EAP-TLS-User 範本（有效期 2 年）..." -ForegroundColor Yellow
 
@@ -427,7 +470,8 @@ Copy-CertificateTemplate `
     -EKUList            @('1.3.6.1.5.5.7.3.2') `
     -EnrollmentFlag     0x00 `
     -NameFlag           0x42000000 `
-    -AutoEnroll         $true
+    -AutoEnroll         $true `
+    -IsMachineType      $false
 
 # ════════════════════════════════════════════════════════════
 #  建立範本三：EAP-TLS-NPS-Server（NPS 伺服器憑證，有效期 2 年）
@@ -461,7 +505,8 @@ Copy-CertificateTemplate `
     -EKUList            @('1.3.6.1.5.5.7.3.1', '1.3.6.1.5.5.7.3.2') `
     -EnrollmentFlag     0x00 `
     -NameFlag           0x18000000 `
-    -AutoEnroll         $true
+    -AutoEnroll         $true `
+    -IsMachineType      $true
 
 # ── 等待 AD 複寫 ─────────────────────────────────────────────
 Write-Host ""
@@ -484,7 +529,7 @@ $AllExist = $true
     $DN  = "CN=$TemplateName,$TemplateBaseDN"
     $Obj = Get-ADObject -Filter { distinguishedName -eq $DN } `
                -SearchBase $TemplateBaseDN `
-               -Properties 'pKIExpirationPeriod','pKIOverlapPeriod','msPKI-Minimal-Key-Size','msPKI-Enrollment-Flag','msPKI-Certificate-Name-Flag' `
+               -Properties 'pKIExpirationPeriod','pKIOverlapPeriod','msPKI-Minimal-Key-Size','msPKI-Enrollment-Flag','msPKI-Certificate-Name-Flag','flags' `
                -ErrorAction SilentlyContinue
 
     if ($Obj) {
@@ -502,6 +547,7 @@ $AllExist = $true
         Write-Host "    最小金鑰長度 ：$($Obj.'msPKI-Minimal-Key-Size') bits" -ForegroundColor Gray
         Write-Host "    申請旗標     ：0x$($Obj.'msPKI-Enrollment-Flag'.ToString('X'))" -ForegroundColor Gray
         Write-Host "    主體名稱旗標 ：0x$($Obj.'msPKI-Certificate-Name-Flag'.ToString('X'))" -ForegroundColor Gray
+        Write-Host "    flags        ：$($Obj.'flags')（0x$([int]$Obj.'flags'.ToString('X'))）" -ForegroundColor Gray
 
         if ($ActualDays -ne $ExpectDays) {
             Write-Host "    [ERROR] 有效期與預期不符！" -ForegroundColor Red
@@ -521,6 +567,25 @@ $AllExist = $true
                 $AllExist = $false
             } else {
                 Write-Host "    [OK] 未偵測到 ENROLLEE_SUPPLIES_SUBJECT 旗標，Subject 由 CA 依 AD 資訊建構。" -ForegroundColor Green
+            }
+
+            $FlagsValue = [int]$Obj.'flags'
+            if ($FlagsValue -band 0x00000040) {
+                Write-Host "    [ERROR] 偵測到 CT_FLAG_MACHINE_TYPE 仍被設定於User範本！這會導致CA改用電腦身份建構Subject（症狀：User憑證核發給電腦），請立即檢查！" -ForegroundColor Red
+                $AllExist = $false
+            } else {
+                Write-Host "    [OK] 未偵測到 MACHINE_TYPE 旗標，此為正確的使用者類型範本。" -ForegroundColor Green
+            }
+        }
+
+        # ── 額外檢查：確認 Computer / NPS 範本有正確包含 MACHINE_TYPE 旗標
+        if ($TemplateName -eq $Params.ComputerTemplateName -or $TemplateName -eq $Params.NPSTemplateName) {
+            $FlagsValue = [int]$Obj.'flags'
+            if (-not ($FlagsValue -band 0x00000040)) {
+                Write-Host "    [ERROR] 此範本應為電腦類型，但 flags 未包含 CT_FLAG_MACHINE_TYPE，請檢查！" -ForegroundColor Red
+                $AllExist = $false
+            } else {
+                Write-Host "    [OK] 已正確包含 MACHINE_TYPE 旗標。" -ForegroundColor Green
             }
         }
     } else {
@@ -686,13 +751,25 @@ certutil -config $CAConfig -catemplates
 Write-Host @"
 
 ==================================================
-  憑證範本建立完成！（v4，含安全性修正 + Renewal上限修正）
+  憑證範本建立完成！（v5，含安全性修正 + Renewal上限修正 + flags/MACHINE_TYPE修正）
   已建立範本：
-    - $($Params.ComputerTemplateName)（1 年，Renewal 273.75 天/6570小時，電腦 Auto-Enrollment，範圍：Domain Computers）
+    - $($Params.ComputerTemplateName)（1 年，Renewal 273.75 天/6570小時，電腦 Auto-Enrollment，範圍：Domain Computers，flags含MACHINE_TYPE）
     - $($Params.UserTemplateName)（2 年，Renewal 547.5 天/13140小時，使用者 Auto-Enrollment，範圍：Domain Users）
       → NameFlag 已修正為 0x42000000，Subject/SAN 一律由 CA 依 AD 資訊建構
-    - $($Params.NPSTemplateName)（2 年，Renewal 547.5 天/13140小時，NPS 伺服器，範圍：$($Params.NPSServersGroupName) 群組）
+      → flags 已修正為不含 MACHINE_TYPE，避免核發給電腦身份
+    - $($Params.NPSTemplateName)（2 年，Renewal 547.5 天/13140小時，NPS 伺服器，範圍：$($Params.NPSServersGroupName) 群組，flags含MACHINE_TYPE）
       → 已限縮權限，僅群組成員可申請，不再開放給所有網域電腦
+
+  【若此前已用舊版腳本核發過憑證，除範本本身外，請務必額外確認】
+    1. Get-ADGroupMember -Identity '$($Params.NPSServersGroupName)'
+       確認群組成員「只有」實際的NPS伺服器電腦帳號，
+       若發現CA伺服器本身或其他非預期電腦也在此群組中，請立即移除
+    2. 確認 $Params.NPSServerComputerNames 陣列內容是否為實際NPS
+       伺服器的正確AD電腦帳號名稱（此前若為預留值 'NPS01','NPS02'
+       未更新，NPS伺服器將無法成功取得憑證）
+    3. 撤銷所有依舊版範本核發的錯誤憑證（含核發給電腦的User憑證、
+       以及核發給非NPS伺服器的NPS-Server憑證），並強制受影響裝置
+       執行 gpupdate /force + certutil -pulse 重新申請
 
   【重要提醒】若此前已使用舊版 v2 腳本建立過範本並已核發憑證：
     1. 請確認是否已有使用者透過舊版 EAP-TLS-User 範本取得憑證
