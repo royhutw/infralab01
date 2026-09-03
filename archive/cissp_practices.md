@@ -1,0 +1,211 @@
+- Assume breach principle
+- Domain 1: Security and Risk Management
+  - Confidentiality
+  - Separation of Duties
+  - Acceptable use policy
+    - Prohibit credential synchronization to private devices
+  - Remote access policy
+  - Awareness Training & Simulated Phishing
+    - Periodized training
+  - BCP/BIA/DR
+    - RTO
+    - RPO
+- Domain 2: Access Security
+  - Inventory Management
+  - CMDB
+    - Only authorized authentication facilities can access the network.
+  - DLP    -
+    - Watermark
+    - USB storage management
+    - Outbound email control
+      - Block, Quarantine(Approval process), warn, notify
+      - Whitelist / blacklist
+    - FTP upload management
+    - Web upload management
+  - Classify Information
+    - Data Labeling
+  - Data Ownership
+  - Media Management
+    - On-line/off-line storage security
+    - Archive
+- Domain 3: Security Architecture and Engineering
+  - Defense-in-Depth
+  - Physical Security Controls
+    - ID Cards
+    - CCTV
+      - Retention policy
+  - Security Baselines
+  - Hardening systems
+  - PKI
+  - Data at rest encryption
+    - Password
+    - RMS
+    - PKI
+- Domain 4: Communication and Network Security
+  - Firewall rule
+    - Default Deny
+    - Boundary Defense
+      - Disable unused/insecure protocols
+    - Internet access blacklist
+  - Disable unused/insecure protocols
+  - Remote Access Security
+  - Email Server
+    - SPF
+    - DKIM
+    - DMARC
+    - Anti-Spam
+    - Anti-Phishing & Social Engineering Mitigation
+    - BEC Detection
+- Domain 5 - Identity and Access Management (IAM)
+  - Authentication
+    - Password policy
+      - Length requirements
+      - Complexity requirements
+    - To log in securely from an insecure network
+      - MFA
+      - VPN
+  - Need-to-Know
+  - Least privilege
+    - Remote access by approval
+  - Privilege creep
+  - Account access reviews & lifecycle Management
+  - Privileged Access Management
+    - Disable built-in administrator account
+    - Change default password
+    - Vaulting & Credential Rotation
+    - MFA
+- Domain 7: Security Operations
+  - Antivirus/anti-malware management
+    - Agent
+    - Regularly update engine/signatures/threat database
+    - Periodic scanning
+    - Anomaly detection alerts management (including when agent has been disabled)
+  - Vulnerability Management
+  - Patch management
+    - Evaluate patches
+    - Test patches
+    - Approve the patches
+    - Deploy the patches
+    - Verify that patches are deployed
+  - SIEM
+    - Logging
+    - Abnormal activity detection(software, hardware, network, physical, off-hours access and threshold-base alerting)
+  - Privileged account management
+    - Privileged access workstation
+    - Bastion Host / Jump Box
+  - Backup
+    - Restoration Testing
+  - Detective and Preventive Measures
+    - Preventive control
+      - Locks
+    - Detective control
+      - CCTV
+- Domain 6: Security Assessment and Testing
+  - Attack Surface Mapping
+  - Vulnerability Scanning
+  - Evaluate control status Assume breach principle
+- Domain 1: Security and Risk Management
+  - Confidentiality
+  - Separation of Duties
+  - Acceptable use policy
+    - Prohibit credential synchronization to private devices
+  - Remote access policy
+  - Awareness Training & Simulated Phishing
+    - Periodized training
+  - BCP/BIA/DR
+    - RTO
+    - RPO
+- Domain 2: Access Security
+  - Inventory Management
+  - CMDB
+    - Only authorized authentication facilities can access the network.
+  - DLP
+    - Watermark
+    - USB storage management
+    - Outbound email control
+      - Block, Quarantine(Approval process), warn, notify
+      - Whitelist / blacklist
+    - FTP upload management
+    - Web upload management
+  - Classify Information
+    - Data Labeling
+  - Data Ownership
+  - Media Management
+    - On-line/off-line storage security
+    - Archive
+- Domain 3: Security Architecture and Engineering
+  - Defense-in-Depth
+  - Physical Security Controls
+    - ID Cards
+    - CCTV
+      - Retention policy
+  - Security Baselines
+  - Hardening systems
+  - PKI
+  - Data at rest encryption
+    - Password
+    - RMS
+    - PKI
+- Domain 4: Communication and Network Security
+  - Firewall rule
+    - Default Deny
+    - Boundary Defense
+      - Disable unused/insecure protocols
+    - Internet access blacklist
+  - Disable unused/insecure protocols
+  - Remote Access Security
+  - Email Server
+    - SPF
+    - DKIM
+    - DMARC
+    - Anti-Spam
+    - Anti-Phishing & Social Engineering Mitigation
+    - BEC Detection
+- Domain 5 - Identity and Access Management (IAM)
+  - Authentication
+    - Password policy
+      - Length requirements
+      - Complexity requirements
+    - To log in securely from an insecure network
+      - MFA
+      - VPN
+  - Need-to-Know
+  - Least privilege
+    - Remote access by approval
+  - Privilege creep
+  - Account access reviews & lifecycle Management
+  - Privileged Access Management
+    - Disable built-in administrator account
+    - Change default password
+    - Vaulting & Credential Rotation
+    - MFA
+- Domain 7: Security Operations
+  - Antivirus/anti-malware management
+    - Agent
+    - Regularly update engine/signatures/threat database
+    - Periodic scanning
+    - Anomaly detection alerts management (including when agent has been disabled)
+  - Vulnerability Management
+  - Patch management
+    - Evaluate patches
+    - Test patches
+    - Approve the patches
+    - Deploy the patches
+    - Verify that patches are deployed
+  - SIEM
+    - Logging
+    - Abnormal activity detection(software, hardware, network, physical, off-hours access and threshold-base alerting)
+  - Privileged account management
+    - Privileged access workstation
+    - Bastion Host / Jump Box
+  - Backup
+    - Restoration Testing
+  - Detective and Preventive Measures
+    - Preventive control
+      - Locks
+    - Detective control
+      - CCTV
+- Domain 6: Security Assessment and Testing
+  - Attack Surface Mapping
+  - Vulnerability Scanning
+  - Evaluate control status
