@@ -1,0 +1,35 @@
+name: glpi
+
+services:
+  glpi:
+    image: "diouxx/glpi:latest"
+    restart: "unless-stopped"
+    container_name: glpi
+    hostname: glpi
+    volumes:
+      # Using a named volume avoids permission issues on host (automatically managed by Docker)
+      - glpi_data:/var/glpi
+      # For GLPI 10.x, uncomment the following line to create a volume for plugins fetched from the marketplace.
+      # - "./storage/glpi_marketplace:/var/www/glpi/marketplace/:rw"
+      - /var/www/html/glpi/:/var/www/html/glpi
+    env_file:
+      - ./glpi.env
+    depends_on:
+      - mariadb
+    ports:
+      - "8080:80"
+      - "8443:443"
+
+  mariadb:
+    image: mariadb:10.7
+    container_name: mariadb
+    hostname: mariadb
+    volumes:
+      - mariadb_data:/var/lib/mysql
+    env_file:
+      - ./mariadb.env
+    restart: "unless-stopped" 
+
+volumes:
+  glpi_data:
+  mariadb_data:
