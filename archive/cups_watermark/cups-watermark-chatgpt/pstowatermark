@@ -1,0 +1,692 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+#
+# v2.0
+#
+# 修正重點（v1.7，相對於 v1.6）：
+#
+#   [根本問題] PowerPoint（以及 Adobe Acrobat 影像列印模式）的 PostScript
+#   輸出，在 %%BeginPageSetup/%%EndPageSetup 區段內會執行：
+#       mysetup concat
+#   這是驅動程式自訂的座標轉換矩陣（實測案例為縮放 0.12 倍 + 90度
+#   旋轉），把驅動程式內部的高精度座標系統，轉換成印表機標準頁面
+#   座標。
+#
+#   v1.6 對於被誤判為 is_powerpoint_raster 的文件，會把浮水印插入在
+#   "LH"（showpage 別名）之前 —— 這個時間點，mysetup concat 早已
+#   執行完畢，座標系統已經被該矩陣扭曲過。我們用標準頁面尺寸算出
+#   的 translate 座標，在這個被扭曲的座標系統下會被矩陣再次轉換，
+#   導致浮水印被映射到完全錯誤的位置（實測：跑到左下角，且因為
+#   矩陣包含縮放，視覺上也被壓縮得模糊不清，幾乎無法辨識）。
+#
+#   [解法] 不再區分「PowerPoint raster」與「一般文件」兩種插入策略，
+#   也不使用 initmatrix（會繞過驅動程式可能更早設定好的
+#   setpagedevice 紙張尺寸/方向設定，引入新風險）。
+#
+#   改為單純把浮水印插入時機提早到 %%BeginPageSetup 這一行之前。
+#   此時 mysetup concat（或任何驅動自訂座標轉換）尚未執行，目前
+#   座標系統仍是 DSC 標準、未被污染的頁面座標系統。浮水印用
+#   gsave/translate/rotate/show/grestore 包好後，grestore 會還原
+#   回插入前的座標系統，不受後續 concat 影響。
+#
+#   這個策略對所有文件類型一致：Word/Excel/AutoCAD 原本就沒有
+#   自訂矩陣，提早插入完全不影響原有運作；PowerPoint/Acrobat
+#   影像列印則因此避開了座標污染問題。
+#
+#   原有的 GRAYSCALE=BLACKONLY 偵測與 halftone 網點繪製邏輯維持
+#   不變，兩者是獨立的修正，互不影響。
+
+import os
+import re
+import sys
+from datetime import datetime
+
+CONFIG_FILE = "/etc/cups/watermark.conf"
+LOG_FILE = "/var/log/cups/watermark.log"
+
+
+##############################################################################
+# Configuration
+##############################################################################
+
+def load_config():
+    cfg = {
+        "enabled": True,
+        "mode": "center",
+        "gray": 0.88,
+        "angle": 45,
+        "font": "Helvetica",
+        "font_size": 18,
+        "line_spacing": 25,
+        "debug": False,
+        # halftone 網點參數（僅在 BLACKONLY 模式下使用）
+        "halftone_freq": 20,        # 網點頻率 (lpi)，越大網點越密集
+        "halftone_angle": 45,       # 網點角度
+        "halftone_coverage": 0.82,  # 網點覆蓋率，越大越淡/越稀疏
+    }
+
+    if not os.path.exists(CONFIG_FILE):
+        return cfg
+
+    with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+        for line in f:
+
+            line = line.strip()
+
+            if not line:
+                continue
+
+            if line.startswith("#"):
+                continue
+
+            if "=" not in line:
+                continue
+
+            key, value = line.split("=", 1)
+
+            key = key.strip()
+            value = value.strip()
+
+            if key == "enabled":
+                cfg[key] = value.lower() == "true"
+
+            elif key == "debug":
+                cfg[key] = value.lower() == "true"
+
+            elif key in (
+                "gray",
+                "angle",
+                "font_size",
+                "line_spacing",
+                "halftone_freq",
+                "halftone_angle",
+                "halftone_coverage",
+            ):
+                try:
+                    cfg[key] = float(value)
+                except Exception:
+                    pass
+
+            else:
+                cfg[key] = value
+
+    return cfg
+
+
+##############################################################################
+# Logging
+##############################################################################
+
+def write_log(msg):
+    try:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(msg)
+            f.write("\n")
+    except Exception:
+        pass
+
+
+##############################################################################
+# PageBoundingBox Parser
+##############################################################################
+
+def parse_bbox(line):
+
+    m = re.search(
+        r"%%PageBoundingBox:\s+(-?\d+)\s+(-?\d+)\s+(-?\d+)\s+(-?\d+)",
+        line
+    )
+
+    if not m:
+        return None
+
+    x1 = int(m.group(1))
+    y1 = int(m.group(2))
+    x2 = int(m.group(3))
+    y2 = int(m.group(4))
+
+    return (
+        x2 - x1,
+        y2 - y1
+    )
+
+
+##############################################################################
+# Escape PostScript String
+##############################################################################
+
+def ps_escape(s):
+
+    s = s.replace("\\", "\\\\")
+    s = s.replace("(", "\\(")
+    s = s.replace(")", "\\)")
+
+    return s
+
+
+##############################################################################
+# Detect 1-bit BLACKONLY mode from PJL header
+##############################################################################
+
+def detect_blackonly_mode(lines):
+    """
+    掃描 PJL header，偵測這個列印工作是否會以 1-bit 純黑白模式處理。
+    符合以下任一條件即視為 BLACKONLY 模式：
+      - @PJL SET GRAYSCALE=BLACKONLY
+      - @PJL SET BITSPERPIXEL=1
+
+    在此模式下，setgray 的淺灰數值會被驅動程式的 threshold 演算法
+    判定為純白而完全消失，必須改用 halftone 網點圖案繪製浮水印。
+    """
+    for line in lines:
+        stripped = line.strip().upper()
+
+        if "GRAYSCALE=BLACKONLY" in stripped:
+            return True
+
+        if re.search(r"BITSPERPIXEL\s*=\s*1\b", stripped):
+            return True
+
+        # PJL header 通常在檔案開頭數十行內結束（ENTER LANGUAGE=POSTSCRIPT
+        # 之後就是 PS 本體），沒必要掃描整份檔案，節省時間
+        if "ENTER LANGUAGE=POSTSCRIPT" in stripped:
+            break
+
+    return False
+
+
+##############################################################################
+# Build Watermark PS — Normal grayscale mode (setgray)
+##############################################################################
+
+def build_watermark_ps_grayscale(
+        cfg,
+        userid,
+        ip,
+        dt,
+        width,
+        height):
+    """
+    一般灰階模式：用標準 setgray 繪製淺灰文字。
+    座標系統假設：插入點在驅動自訂矩陣（如有）執行之前，
+    因此 width/height 對應的就是目前座標系統下的頁面尺寸。
+    """
+
+    cx = int(width / 2)
+    cy = int(height / 2)
+
+    userid = ps_escape(userid)
+    ip = ps_escape(ip)
+    dt = ps_escape(dt)
+
+    angle = cfg["angle"]
+    gray = cfg["gray"]
+    font = cfg["font"]
+    font_size = int(cfg["font_size"])
+    line_spacing = int(cfg["line_spacing"])
+
+    ps = []
+
+    ps.append("%%BeginWatermark")
+    ps.append("gsave")
+
+    ps.append(
+        f"{cx} {cy} translate"
+    )
+
+    ps.append(
+        f"{angle} rotate"
+    )
+
+    ps.append(
+        f"{gray} setgray"
+    )
+
+    ps.append(
+        f"/{font} findfont"
+    )
+
+    ps.append(
+        f"{font_size} scalefont"
+    )
+
+    ps.append("setfont")
+
+    ps.append(
+        f"0 0 moveto ({userid}) show"
+    )
+
+    ps.append(
+        f"0 -{line_spacing} moveto ({ip}) show"
+    )
+
+    ps.append(
+        f"0 -{line_spacing * 2} moveto ({dt}) show"
+    )
+
+    ps.append("grestore")
+    ps.append("%%EndWatermark")
+
+    return "\n".join(ps) + "\n"
+
+
+##############################################################################
+# Build Watermark PS — 1-bit BLACKONLY mode (setscreen halftone)
+##############################################################################
+
+def build_watermark_ps_halftone(
+        cfg,
+        userid,
+        ip,
+        dt,
+        width,
+        height):
+    """
+    1-bit 純黑白模式：用 setscreen 自訂 halftone 網點圖案繪製文字，
+    取代 setgray。文字由稀疏的純黑網點構成，視覺上呈現「淡」的效果，
+    但全程只用純黑/純白兩種狀態，不依賴任何灰階轉換 —— 因此無論
+    驅動程式的色彩模式如何設定，網點圖案都會被正確保留，不會像
+    setgray 那樣被 threshold 演算法誤判為純白而消失。
+
+    setscreen 語法：frequency angle {spotfunction} setscreen
+      - frequency:  網點頻率 (lpi)，數字越大網點越密、越細緻
+      - angle:      網點排列角度
+      - spotfunction: 接收座標 (x,y 範圍 -1.0~1.0)，回傳值與目前
+                    setgray 的灰階值比較，決定該採樣點最終黑或白
+      - 緊接著的 setgray 數值才是真正控制「網點覆蓋率/稀疏程度」
+        的參數：數值越接近 1（白），網點越稀疏，視覺越淡。
+    """
+
+    cx = int(width / 2)
+    cy = int(height / 2)
+
+    userid = ps_escape(userid)
+    ip = ps_escape(ip)
+    dt = ps_escape(dt)
+
+    angle = cfg["angle"]
+    font = cfg["font"]
+    font_size = int(cfg["font_size"])
+    line_spacing = int(cfg["line_spacing"])
+
+    ht_freq = cfg["halftone_freq"]
+    ht_angle = cfg["halftone_angle"]
+    ht_coverage = cfg["halftone_coverage"]
+
+    ps = []
+
+    ps.append("%%BeginWatermark")
+    ps.append("gsave")
+
+    ps.append(
+        f"{cx} {cy} translate"
+    )
+
+    ps.append(
+        f"{angle} rotate"
+    )
+
+    # --- 自訂 halftone 網點圖案，取代 setgray ---
+    ps.append(
+        f"{ht_freq} {ht_angle} "
+        "{dup mul exch dup mul add 1 exch sub} setscreen"
+    )
+
+    ps.append(
+        f"{ht_coverage} setgray"
+    )
+
+    ps.append(
+        f"/{font} findfont"
+    )
+
+    ps.append(
+        f"{font_size} scalefont"
+    )
+
+    ps.append("setfont")
+
+    ps.append(
+        f"0 0 moveto ({userid}) show"
+    )
+
+    ps.append(
+        f"0 -{line_spacing} moveto ({ip}) show"
+    )
+
+    ps.append(
+        f"0 -{line_spacing * 2} moveto ({dt}) show"
+    )
+
+    ps.append("grestore")
+    ps.append("%%EndWatermark")
+
+    return "\n".join(ps) + "\n"
+
+
+##############################################################################
+# Build Watermark PS — dispatch by mode
+##############################################################################
+
+def build_watermark_ps(
+        cfg,
+        userid,
+        ip,
+        dt):
+
+    userid = ps_escape(userid)
+    ip = ps_escape(ip)
+    dt = ps_escape(dt)
+
+    angle = cfg["angle"]
+    gray = cfg["gray"]
+    font = cfg["font"]
+    font_size = int(cfg["font_size"])
+    line_spacing = int(cfg["line_spacing"])
+
+    ps = []
+
+    ps.append("%%BeginWatermark")
+    ps.append("gsave")
+
+    #
+    # Reset to physical page coordinate
+    #
+
+    # ps.append("initmatrix")
+
+    #
+    # Obtain actual printable area
+    #
+    # ps.append("initclip")
+    # ps.append("clippath pathbbox")
+
+    # ps.append("/ury exch def")
+    # ps.append("/urx exch def")
+    # ps.append("/lly exch def")
+    # ps.append("/llx exch def")
+
+    ps.append(
+        "(WM bbox:) print "
+        "llx == lly == urx == ury =="
+    )
+    #
+    # Move to page center
+    #
+
+    # ps.append(
+    #     "llx urx add 2 div "
+    #     "lly ury add 2 div "
+    #     "translate"
+    # )
+    ps.append("initmatrix")
+    ps.append("300 420 translate")
+    #
+    # Rotate watermark
+    #
+
+    ps.append(f"{angle} rotate")
+
+    #
+    # Gray level
+    #
+
+    ps.append(f"{gray} setgray")
+
+    #
+    # Font
+    #
+
+    ps.append(
+        f"/{font} findfont "
+        f"{font_size} scalefont "
+        f"setfont"
+    )
+
+    #
+    # Center align
+    #
+
+    # ps.append(
+    #     f"({userid}) "
+    #     "dup stringwidth pop -2 div 0 moveto show"
+    # )
+    ps.append(
+        f"({userid}) dup stringwidth pop -2 div 0 moveto"
+    )
+    ps.append(
+        f"({userid}) show"
+    )
+
+    ps.append(
+        f"({ip}) dup stringwidth pop -2 div "
+        f"-{line_spacing} moveto"
+    )
+    ps.append(
+        f"({ip}) show"
+    )
+
+    ps.append(
+        f"({dt}) dup stringwidth pop -2 div "
+        f"-{line_spacing * 2} moveto"
+    )
+    ps.append(
+        f"({dt}) show"
+    )
+
+    ps.append(
+        f"({ip}) "
+        f"dup stringwidth pop -2 div "
+        f"-{line_spacing} moveto "
+        f"show"
+    )
+
+    ps.append(
+        f"({dt}) "
+        f"dup stringwidth pop -2 div "
+        f"-{line_spacing * 2} moveto "
+        f"show"
+    )
+
+    ps.append("grestore")
+    ps.append("%%EndWatermark")
+
+    return "\n".join(ps) + "\n"
+
+
+##############################################################################
+# Main
+##############################################################################
+
+def main():
+
+    if len(sys.argv) < 7:
+        sys.exit(1)
+
+    jobid = sys.argv[1]
+    userid = sys.argv[2]
+    title = sys.argv[3]
+    copies = sys.argv[4]
+    filename = sys.argv[6]
+
+    cfg = load_config()
+
+    #
+    # Disabled
+    #
+
+    if not cfg["enabled"]:
+        with open(filename, "r", errors="ignore") as f:
+            sys.stdout.write(f.read())
+
+        sys.exit(0)
+
+    client_ip = os.getenv(
+        "REMOTE_ADDR",
+        "UNKNOWN"
+    )
+
+    print_time = datetime.now().strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
+
+    #
+    # Read PS file
+    #
+
+    with open(
+        filename,
+        "r",
+        errors="ignore"
+    ) as f:
+        lines = f.readlines()
+
+    #
+    # Detect page size
+    #
+
+    # width = 571
+    # height = 816
+
+    # for line in lines:
+
+    #     box = parse_bbox(line)
+
+    #     if box:
+    #         width, height = box
+    #         break
+
+    #
+    # Detect 1-bit BLACKONLY mode
+    #
+    # 任何文件類型，只要驅動設定送出 GRAYSCALE=BLACKONLY 或
+    # BITSPERPIXEL=1，setgray 的淺灰數值都會被 threshold 成純白
+    # 而消失，必須改用 halftone 網點圖案繪製浮水印。這個偵測獨立
+    # 於座標插入點的修正，兩者解決的是不同層面的問題。
+    #
+
+    blackonly_mode = detect_blackonly_mode(lines)
+
+    #
+    # Build watermark
+    #
+
+    # wm = build_watermark_ps(
+    #     cfg,
+    #     userid,
+    #     client_ip,
+    #     print_time,
+    #     width,
+    #     height,
+    #     blackonly_mode
+    # )
+
+    wm = build_watermark_ps(
+        cfg,
+        userid,
+        client_ip,
+        print_time
+    )
+
+    page_count = 0
+    setup_count = 0
+
+    #
+    # Inject
+    #
+    # 統一策略：在每一頁的 %%BeginPageSetup 之前插入浮水印。
+    #
+    # 原因：驅動程式常在 %%BeginPageSetup/%%EndPageSetup 區段內
+    # 執行自訂座標轉換（例如 PowerPoint 輸出的 "mysetup concat"，
+    # 實測案例包含縮放 0.12 倍 + 90度旋轉，把驅動程式內部高精度
+    # 座標系統轉換成標準頁面座標）。若浮水印插入點位於這個矩陣
+    # 執行「之後」，浮水印的 translate/rotate 座標會被該矩陣
+    # 二次套用，導致位置偏移、視覺扭曲，實測案例中浮水印被映射
+    # 到頁面左下角，且因縮放關係變得模糊難以辨識。
+    #
+    # 在 %%BeginPageSetup 之前插入，可確保浮水印永遠在 DSC 標準、
+    # 未被任何驅動自訂矩陣污染的頁面座標系統下繪製。gsave/grestore
+    # 包住浮水印指令，grestore 後座標系統還原，後續的 mysetup
+    # concat（或其他轉換）只會作用在原本的文件內容上，不會把
+    # 浮水印拖進被轉換過的座標空間。
+    #
+    # 這個策略對所有文件類型一致有效（Word/Excel/AutoCAD 本來就
+    # 沒有自訂矩陣，提早插入不影響既有正確運作；PowerPoint/Adobe
+    # Acrobat 影像列印模式則藉此避開座標污染問題），因此不再需要
+    # 額外判斷「是否為 PowerPoint raster job」這個容易誤判的條件。
+    #
+
+    output = []
+
+    for line in lines:
+
+        if line.startswith("%%Page:"):
+            page_count += 1
+
+        # if line.startswith("%%BeginPageSetup"):
+        #     setup_count += 1
+        #     output.append(wm)
+        #     output.append(line)
+        #     continue
+
+        if line.startswith("%%BeginPageSetup"):
+            setup_count += 1
+            output.append(line)
+            continue
+
+        if line.startswith("%%EndPageSetup"):
+            output.append(line)
+            output.append(wm)
+            continue
+
+        output.append(line)
+
+    #
+    # Fallback：若整份文件完全沒有 %%BeginPageSetup
+    # （部分簡單文件可能省略這個區段），改成在每個
+    # %%Page: 行之後立即插入，重新處理一次原始 lines，
+    # 避免與上面主流程的輸出重複。
+    #
+
+    if setup_count == 0 and page_count > 0:
+
+        write_log(
+            "WARNING: No %%BeginPageSetup found, "
+            "falling back to %%Page: injection"
+        )
+
+        output = []
+
+        for line in lines:
+            output.append(line)
+            if line.startswith("%%Page:"):
+                output.append(wm)
+
+    sys.stdout.write("".join(output))
+
+    #
+    # Audit log
+    #
+
+    log = []
+
+    log.append(print_time)
+    log.append("Version=1.7")
+    log.append(f"JobID={jobid}")
+    log.append(f"User={userid}")
+    log.append(f"ClientIP={client_ip}")
+    log.append(f"Title={title}")
+    log.append(f"Copies={copies}")
+    log.append(f"Pages={page_count}")
+    log.append(f"SetupInjectionCount={setup_count}")
+    log.append(f"BlackOnlyMode={blackonly_mode}")
+    log.append("Status=OK")
+    log.append("")
+
+    write_log(
+        "\n".join(log)
+    )
+
+
+if __name__ == "__main__":
+    main()

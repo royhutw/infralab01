@@ -1,0 +1,410 @@
+#!/usr/bin/env python3
+# =============================================================================
+# CUPS Watermark Filter v5 — PDF-based Overlay Architecture
+# 檔案：/usr/lib/cups/filter/cups-watermark-filter
+#
+# 架構：
+#   PostScript (來自 HP UPS Driver，Passthrough 已關閉，結構統一)
+#       │
+#       ▼ Ghostscript (ps2pdf)
+#   PDF（原始內容）
+#       │
+#       ▼ pikepdf + reportlab
+#   PDF（每頁疊印 userid / hostname+IP / datetime，45度淺灰）
+#       │
+#       ▼ Ghostscript (pdf2ps) 或直接輸出 PDF
+#   PostScript / PDF（送往印表機）
+#
+# 前提條件（已由管理者確認）：
+#   - 所有 Windows 用戶端強制使用 HP Universal PS Driver
+#   - PostScript Passthrough 已關閉
+#   - CUPS 僅接受 application/postscript 輸入（由 watermark.convs 限制）
+#
+# CUPS filter 呼叫格式：
+#   filter job-id user title copies options [filename]
+# =============================================================================
+
+import sys
+import os
+import re
+import io
+import datetime
+import subprocess
+import tempfile
+import shutil
+
+import pikepdf
+from reportlab.pdfgen import canvas
+from reportlab.lib.colors import Color
+
+# ---------------------------------------------------------------------------
+# 0. 共用：syslog 記錄
+# ---------------------------------------------------------------------------
+def log_info(msg):
+    try:
+        import syslog
+        syslog.openlog("cups-watermark")
+        syslog.syslog(syslog.LOG_INFO, msg)
+        syslog.closelog()
+    except Exception:
+        pass
+
+def log_err(msg):
+    try:
+        import syslog
+        syslog.openlog("cups-watermark")
+        syslog.syslog(syslog.LOG_ERR, msg)
+        syslog.closelog()
+    except Exception:
+        pass
+
+# ---------------------------------------------------------------------------
+# 1. 取得 CUPS 工作資訊
+# ---------------------------------------------------------------------------
+def get_job_info():
+    job_id    = sys.argv[1] if len(sys.argv) > 1 else "0"
+    cups_user = sys.argv[2] if len(sys.argv) > 2 else "unknown"
+    title     = sys.argv[3] if len(sys.argv) > 3 else ""
+    copies    = sys.argv[4] if len(sys.argv) > 4 else "1"
+    options   = sys.argv[5] if len(sys.argv) > 5 else ""
+
+    # 客戶端 IP：由 CUPS server 端觀測，無法被使用者偽造
+    client_ip = (
+        os.environ.get("REMOTE_HOST") or
+        os.environ.get("IPP_CLIENT_IP") or
+        os.environ.get("CLIENT_IP") or
+        "unknown-ip"
+    )
+    return {
+        "job_id":    job_id,
+        "cups_user": cups_user,
+        "client_ip": client_ip,
+        "title":     title,
+        "copies":    copies,
+        "options":   options,
+    }
+
+# ---------------------------------------------------------------------------
+# 2. 讀取輸入（stdin 或 filename）
+# ---------------------------------------------------------------------------
+def read_input_raw():
+    if len(sys.argv) > 6 and sys.argv[6]:
+        with open(sys.argv[6], "rb") as f:
+            return f.read()
+    else:
+        return sys.stdin.buffer.read()
+
+# ---------------------------------------------------------------------------
+# 3. 解析 PJL Header，分離 PJL 與 PS 本體
+# ---------------------------------------------------------------------------
+def parse_pjl_header(raw_bytes):
+    """
+    回傳 (pjl_part_bytes, ps_part_bytes, meta_dict)
+    meta_dict: username / hostname / print_dt
+    """
+    try:
+        text = raw_bytes.decode("latin-1")
+    except Exception:
+        text = raw_bytes.decode("utf-8", errors="replace")
+
+    meta = {"username": "", "hostname": "", "print_dt": ""}
+    pjl_part = ""
+    ps_part_text = text
+
+    ps_start_match = re.search(r'(%!PS-Adobe)', text)
+    if ps_start_match:
+        pjl_part = text[:ps_start_match.start()]
+        ps_part_text = text[ps_start_match.start():]
+
+        # username：JobAcct1 優先，次 USERNAME
+        m = re.search(r'JobAcct1=([^\s"\\]+)', pjl_part)
+        if m:
+            meta["username"] = m.group(1).strip()
+        if not meta["username"]:
+            m = re.search(r'@PJL\s+SET\s+USERNAME="?([^"\r\n]+)"?', pjl_part, re.IGNORECASE)
+            if m:
+                meta["username"] = m.group(1).strip()
+
+        # hostname：JobAcct2
+        m = re.search(r'JobAcct2=([^\s"\\]+)', pjl_part)
+        if m:
+            meta["hostname"] = m.group(1).strip()
+
+        # 列印時間：JobAcct4（YYYYMMDDHHmmss）
+        m = re.search(r'JobAcct4=(\d{14})', pjl_part)
+        if m:
+            meta["print_dt"] = m.group(1).strip()
+
+    pjl_bytes = pjl_part.encode("latin-1", errors="replace")
+    ps_bytes  = ps_part_text.encode("latin-1", errors="replace")
+    return pjl_bytes, ps_bytes, meta
+
+# ---------------------------------------------------------------------------
+# 4. 組合浮水印三行文字
+# ---------------------------------------------------------------------------
+def build_watermark_lines(job_info, pjl_meta):
+    userid = pjl_meta.get("username") or job_info.get("cups_user") or "unknown"
+
+    hostname  = pjl_meta.get("hostname") or ""
+    client_ip = job_info.get("client_ip") or "unknown"
+    if hostname and hostname.upper() != str(client_ip).upper():
+        host_ip_line = f"{hostname} / {client_ip}"
+    else:
+        host_ip_line = client_ip
+
+    raw_dt = pjl_meta.get("print_dt") or ""
+    if raw_dt and len(raw_dt) == 14:
+        try:
+            dt_obj = datetime.datetime.strptime(raw_dt, "%Y%m%d%H%M%S")
+            dt_str = dt_obj.strftime("%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            dt_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    else:
+        dt_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    return [userid, host_ip_line, dt_str]
+
+# ---------------------------------------------------------------------------
+# 5. 尋找外部工具路徑
+# ---------------------------------------------------------------------------
+def find_tool(names):
+    """依序嘗試多個候選路徑/名稱，回傳第一個找到的可執行檔路徑"""
+    candidates = []
+    for name in names:
+        if name.startswith("/"):
+            candidates.append(name)
+        else:
+            found = shutil.which(name)
+            if found:
+                candidates.append(found)
+    for path in candidates:
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+    return None
+
+def find_ghostscript():
+    return find_tool([
+        "/usr/bin/gs",
+        "/usr/local/bin/gs",
+        "gs",
+    ])
+
+# ---------------------------------------------------------------------------
+# 6. PostScript → PDF（Ghostscript）
+# ---------------------------------------------------------------------------
+def ps_to_pdf(ps_bytes, gs_path):
+    """
+    用 Ghostscript 把 PostScript 轉成 PDF。
+    使用暫存檔案而非純 pipe，避免 Ghostscript 對 stdin/stdout 處理大型
+    二進位資料（如嵌入圖片）時的緩衝區問題。
+    """
+    with tempfile.NamedTemporaryFile(suffix=".ps", delete=False) as f_in:
+        f_in.write(ps_bytes)
+        in_path = f_in.name
+
+    out_fd, out_path = tempfile.mkstemp(suffix=".pdf")
+    os.close(out_fd)
+
+    cmd = [
+        gs_path,
+        "-q", "-dQUIET", "-dSAFER", "-dBATCH", "-dNOPAUSE",
+        "-dNOINTERPOLATE",
+        "-sDEVICE=pdfwrite",
+        "-dCompatibilityLevel=1.4",
+        "-dAutoRotatePages=/None",
+        "-dPDFSETTINGS=/printer",
+        f"-sOutputFile={out_path}",
+        in_path,
+    ]
+
+    try:
+        proc = subprocess.run(cmd, capture_output=True, timeout=120)
+        if proc.returncode != 0:
+            log_err(f"ps2pdf failed (rc={proc.returncode}): {proc.stderr[:500]!r}")
+            return None
+        with open(out_path, "rb") as f:
+            pdf_bytes = f.read()
+        return pdf_bytes
+    except subprocess.TimeoutExpired:
+        log_err("ps2pdf timeout (>120s)")
+        return None
+    except Exception as e:
+        log_err(f"ps2pdf exception: {e}")
+        return None
+    finally:
+        for p in (in_path, out_path):
+            try:
+                os.unlink(p)
+            except Exception:
+                pass
+
+# ---------------------------------------------------------------------------
+# 7. PDF → PostScript（Ghostscript，輸出階段使用）
+# ---------------------------------------------------------------------------
+def pdf_to_ps(pdf_bytes, gs_path):
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f_in:
+        f_in.write(pdf_bytes)
+        in_path = f_in.name
+
+    out_fd, out_path = tempfile.mkstemp(suffix=".ps")
+    os.close(out_fd)
+
+    cmd = [
+        gs_path,
+        "-q", "-dQUIET", "-dSAFER", "-dBATCH", "-dNOPAUSE",
+        "-sDEVICE=ps2write",
+        "-dCompatibilityLevel=1.4",
+        f"-sOutputFile={out_path}",
+        in_path,
+    ]
+
+    try:
+        proc = subprocess.run(cmd, capture_output=True, timeout=120)
+        if proc.returncode != 0:
+            log_err(f"pdf2ps failed (rc={proc.returncode}): {proc.stderr[:500]!r}")
+            return None
+        with open(out_path, "rb") as f:
+            ps_bytes = f.read()
+        return ps_bytes
+    except subprocess.TimeoutExpired:
+        log_err("pdf2ps timeout (>120s)")
+        return None
+    except Exception as e:
+        log_err(f"pdf2ps exception: {e}")
+        return None
+    finally:
+        for p in (in_path, out_path):
+            try:
+                os.unlink(p)
+            except Exception:
+                pass
+
+# ---------------------------------------------------------------------------
+# 8. 產生單頁浮水印疊印層（reportlab → PDF bytes）
+# ---------------------------------------------------------------------------
+def create_watermark_overlay_pdf(page_width_pt, page_height_pt, lines,
+                                  gray=0.55, alpha=0.40, base_fontsize=28):
+    """
+    產生一頁透明背景的浮水印 PDF，45度旋轉、三行文字置中。
+    字型大小依紙張短邊（相對 A4 短邊 595pt）等比例縮放，
+    使浮水印在不同紙張尺寸（A3/A4/Letter）及橫向/縱向下視覺比例一致。
+    """
+    buf = io.BytesIO()
+    c = canvas.Canvas(buf, pagesize=(page_width_pt, page_height_pt))
+
+    short_side = min(page_width_pt, page_height_pt)
+    fontsize = base_fontsize * (short_side / 595.0)
+    line_gap = fontsize * 1.5
+
+    c.saveState()
+    c.translate(page_width_pt / 2.0, page_height_pt / 2.0)
+    c.rotate(45)
+    c.setFillColor(Color(gray, gray, gray, alpha=alpha))
+    c.setFont("Helvetica", fontsize)
+
+    # 三行：上中下，置中對齊
+    c.drawCentredString(0, line_gap, lines[0])
+    c.drawCentredString(0, 0, lines[1])
+    c.drawCentredString(0, -line_gap - fontsize, lines[2])
+
+    c.restoreState()
+    c.showPage()
+    c.save()
+    buf.seek(0)
+    return buf.read()
+
+# ---------------------------------------------------------------------------
+# 9. 將浮水印疊印到每一頁 PDF（pikepdf）
+# ---------------------------------------------------------------------------
+def apply_watermark_to_pdf(pdf_bytes, lines):
+    """
+    讀取原始 PDF，對每一頁依該頁實際尺寸（MediaBox）產生對應的浮水印疊印層，
+    並合併到原頁面上層（疊印在最上層，不會被原內容覆蓋，因為是後合併）。
+    自動處理不同頁面尺寸與橫向/縱向（MediaBox 寬高已反映實際方向）。
+    """
+    with pikepdf.open(io.BytesIO(pdf_bytes)) as pdf:
+        for page in pdf.pages:
+            mbox = page.MediaBox
+            # MediaBox: [llx, lly, urx, ury]
+            llx, lly, urx, ury = [float(v) for v in mbox]
+            page_w = urx - llx
+            page_h = ury - lly
+
+            overlay_bytes = create_watermark_overlay_pdf(page_w, page_h, lines)
+
+            with pikepdf.open(io.BytesIO(overlay_bytes)) as overlay_pdf:
+                overlay_page = overlay_pdf.pages[0]
+                # add_overlay 預設疊在現有內容「之上」
+                page.add_overlay(overlay_page)
+
+        out_buf = io.BytesIO()
+        pdf.save(out_buf)
+        return out_buf.getvalue()
+
+# ---------------------------------------------------------------------------
+# 10. 主程式
+# ---------------------------------------------------------------------------
+def main():
+    job_info = get_job_info()
+    raw_data = read_input_raw()
+
+    # --- 安全檢查：確認輸入確實是 PostScript ---
+    # （CUPS MIME 層已限制只接受 application/postscript，此處為第二層保險）
+    head = raw_data[:4096]
+    is_ps_like = (b"%!PS" in head) or (b"@PJL" in head)
+    if not is_ps_like:
+        log_err(f"job={job_info['job_id']}: input does not look like "
+                f"PostScript/PJL (first bytes: {head[:50]!r}); aborting")
+        sys.stderr.write(
+            "cups-watermark-filter: ERROR - input is not PostScript. "
+            "This queue only accepts application/postscript.\n"
+        )
+        sys.exit(1)
+
+    gs_path = find_ghostscript()
+    if not gs_path:
+        log_err(f"job={job_info['job_id']}: ghostscript (gs) not found")
+        sys.stderr.write("cups-watermark-filter: ERROR - ghostscript not found\n")
+        sys.exit(1)
+
+    # --- 分離 PJL header 與 PS 本體 ---
+    pjl_bytes, ps_bytes, pjl_meta = parse_pjl_header(raw_data)
+
+    # --- PostScript → PDF ---
+    pdf_bytes = ps_to_pdf(ps_bytes, gs_path)
+    if pdf_bytes is None:
+        log_err(f"job={job_info['job_id']}: ps_to_pdf failed; "
+                f"falling back to passthrough without watermark")
+        # Fallback：轉檔失敗時，至少讓工作印出來（不加浮水印），
+        # 避免完全無法列印造成更大的業務影響。
+        sys.stdout.buffer.write(raw_data)
+        sys.exit(0)
+
+    # --- 組合浮水印文字 ---
+    wm_lines = build_watermark_lines(job_info, pjl_meta)
+
+    # --- 疊印浮水印 ---
+    try:
+        watermarked_pdf = apply_watermark_to_pdf(pdf_bytes, wm_lines)
+    except Exception as e:
+        log_err(f"job={job_info['job_id']}: watermark overlay failed: {e}; "
+                f"falling back to un-watermarked PDF")
+        watermarked_pdf = pdf_bytes  # 疊印失敗仍送印，不中斷列印工作
+
+    # --- PDF → PostScript（送往 PostScript 印表機）---
+    final_ps = pdf_to_ps(watermarked_pdf, gs_path)
+    if final_ps is None:
+        log_err(f"job={job_info['job_id']}: pdf_to_ps failed; "
+                f"outputting PDF directly (printer may still accept it)")
+        sys.stdout.buffer.write(watermarked_pdf)
+        sys.exit(0)
+
+    sys.stdout.buffer.write(final_ps)
+
+    log_info(
+        f"Watermark applied: job={job_info['job_id']} "
+        f"user={wm_lines[0]} host_ip={wm_lines[1]} dt={wm_lines[2]}"
+    )
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,21 @@
+# =============================================================================
+# /etc/cups/watermark.convs  (v5 — PDF-overlay 架構)
+#
+# 設計前提（已由管理者確認並落實）：
+#   - 所有 Windows 用戶端強制使用 HP Universal PS Driver
+#   - PostScript Passthrough 已關閉
+#   - 因此 CUPS 收到的列印工作「必定」是 application/postscript
+#
+# 本檔案只定義一條規則：
+#   application/postscript → application/vnd.cups-postscript
+#   cost 50（低於標準 pstops 的 cost 66，確保優先被選用）
+#
+# filter 內部會自行完成：
+#   PostScript → PDF（Ghostscript）→ 疊印浮水印（Python）→ PostScript（Ghostscript）
+#   最終輸出已是 application/vnd.cups-postscript 相容格式，
+#   不需要再額外呼叫 pstops。
+#
+# 格式：source-type  destination-type  cost  filter
+# =============================================================================
+
+application/postscript  application/vnd.cups-postscript  50  cups-watermark-filter
