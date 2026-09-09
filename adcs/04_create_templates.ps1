@@ -72,6 +72,25 @@
 #      動態計算 flags：Computer / NPS-Server 範本保留 MACHINE_TYPE
 #      （這兩者本應為電腦類型範本），User 範本則移除此位元。
 #      同時新增自動驗證，建立範本後會檢查各範本的 flags 是否正確。
+#
+#    v6（本次修正，重要，解釋「AD CS自己拿到User/NPS-Server憑證」）：
+#      實測發現 CA 伺服器（ADCS）本身能不受限制地取得 EAP-TLS-User
+#      與 EAP-TLS-NPS-Server 憑證，追查後確認 Certificate Templates
+#      容器預設繼承了 "NT AUTHORITY\SYSTEM = GenericAll" 規則——當
+#      Autoenrollment 用戶端與 CA 伺服器程式位於同一台機器時，會以
+#      本機 SYSTEM 權杖比對權限，直接命中此繼承規則，繞過我們明確
+#      設定的 Enroll 對象限制（v3的NPS-Servers群組限制、User範本的
+#      Domain Users限制皆被繞過）。
+#      舊版 Set-TemplateACL 函式僅「新增」Allow規則，從未處理繼承
+#      而來的既有規則，兩者並存下只要任一規則允許即可通過，這是
+#      根本設計缺陷，不只是SYSTEM這一個特例的問題。
+#      已新增 Set-TemplateACL-Hardened 函式，針對 EAP-TLS-User 與
+#      EAP-TLS-NPS-Server 這兩個對「誰能取得」有明確限定需求的範本，
+#      停用繼承（SetAccessRuleProtection），僅保留明確定義的權限
+#      清單（管理群組 Full Control + 指定對象 Read/Enroll/Autoenroll），
+#      徹底排除任何未來可能出現的類似繼承漏洞。EAP-TLS-Computer維持
+#      原本的繼承設計，因為該範本本來就開放給所有網域電腦，繼承而
+#      來的權限對它不構成額外風險。
 # ============================================================
 
 #region ── 參數區（請依實際環境修改） ────────────────────────
@@ -148,7 +167,7 @@ if (-not (Get-Module -ListAvailable -Name ActiveDirectory)) {
 
 Write-Host ""
 Write-Host "=================================================="  -ForegroundColor Cyan
-Write-Host "  建立 802.1x EAP-TLS 憑證範本 v5"                  -ForegroundColor Cyan
+Write-Host "  建立 802.1x EAP-TLS 憑證範本 v6"                  -ForegroundColor Cyan
 Write-Host "=================================================="  -ForegroundColor Cyan
 Write-Host ""
 
@@ -723,25 +742,123 @@ function Set-TemplateACL {
     $TemplateObj.CommitChanges()
 }
 
+# ════════════════════════════════════════════════════════════
+#  Hardened 版本：停用繼承，僅保留明確定義的權限清單
+# ════════════════════════════════════════════════════════════
+#
+#  適用對象：EAP-TLS-User、EAP-TLS-NPS-Server（敏感度較高、
+#  對「誰能拿到」有明確限定需求的範本）。
+#
+#  EAP-TLS-Computer 維持使用上方 Set-TemplateACL（不停用繼承），
+#  因為該範本本來就設計給所有網域電腦使用，繼承而來的權限
+#  （SYSTEM、Domain/Enterprise Admins）對它不構成額外風險。
+#
+#  背景（重要，記錄本次問題根因）：
+#    先前發現 ADCS（CA伺服器本身）能不受限制地取得 EAP-TLS-User
+#    與 EAP-TLS-NPS-Server 憑證，追查後確認是 Certificate Templates
+#    容器繼承而來的 "NT AUTHORITY\SYSTEM = GenericAll" 規則所致——
+#    當 Autoenrollment 用戶端與 CA 伺服器程式位於同一台機器時，
+#    會直接以本機 SYSTEM 權杖比對權限，命中此繼承規則，繞過我們
+#    明確設定的 Enroll 對象限制。
+#
+#    單純針對 SYSTEM 加一筆 Deny 規則只能治標，且只解決這一個
+#    已知案例；更根本的做法是停用繼承，只保留我們明確定義的
+#    權限清單（管理群組 Full Control + 指定對象 Read/Enroll/
+#    Autoenroll），徹底排除任何未來可能出現的類似繼承漏洞。
+#
+#  Overhead 評估：EAP-TLS 類範本異動頻率低，且 Autoenrollment
+#  流程本身不依賴額外人為介入，停用繼承後唯一的成本僅發生在
+#  未來極少數需要編輯範本設定的時刻（屆時本來就需要 Domain Admin
+#  帳號介入處理），與日常運作完全脫鉤，成本效益合理。
+#
+function Set-TemplateACL-Hardened {
+    param(
+        [string] $TemplateName,
+        [array]  $EnrollPrincipals,       # 可以 Enroll+Autoenroll 的對象清單
+        [array]  $ReadOnlyPrincipals = @(), # 僅需 Read（查看/稽核用途）的對象清單
+        [array]  $FullControlPrincipals,  # 需要完整管理權限的對象（管理群組）
+        [string] $DomainName
+    )
+
+    $TemplateDN  = "LDAP://CN=$TemplateName,$TemplateBaseDN"
+    $TemplateObj = [ADSI]$TemplateDN
+    $ACL         = $TemplateObj.ObjectSecurity
+
+    # ── 關鍵：停用繼承，且不保留現有繼承規則的副本 ──────────
+    $ACL.SetAccessRuleProtection($true, $false)
+
+    # ── 明確授予管理群組 Full Control（取代原本繼承而來的） ──
+    foreach ($AdminGroup in $FullControlPrincipals) {
+        $Principal = New-Object System.Security.Principal.NTAccount($DomainName, $AdminGroup)
+        $ACE_Full  = New-Object System.DirectoryServices.ActiveDirectoryAccessRule(
+            $Principal,
+            [System.DirectoryServices.ActiveDirectoryRights]::GenericAll,
+            [System.Security.AccessControl.AccessControlType]::Allow,
+            [System.DirectoryServices.ActiveDirectorySecurityInheritance]::None
+        )
+        $ACL.AddAccessRule($ACE_Full)
+    }
+
+    # ── 僅 Read（查看/稽核用途，無法申請憑證、無法編輯）────────
+    foreach ($ReadTarget in $ReadOnlyPrincipals) {
+        $Principal = New-Object System.Security.Principal.NTAccount($DomainName, $ReadTarget)
+        $ACL.AddAccessRule((New-Object System.DirectoryServices.ActiveDirectoryAccessRule(
+            $Principal, [System.DirectoryServices.ActiveDirectoryRights]::GenericRead,
+            [System.Security.AccessControl.AccessControlType]::Allow,
+            [System.DirectoryServices.ActiveDirectorySecurityInheritance]::None)))
+    }
+
+    # ── 明確授予指定對象 Read + Enroll + Autoenroll ──────────
+    foreach ($EnrollTarget in $EnrollPrincipals) {
+        $Principal = New-Object System.Security.Principal.NTAccount($DomainName, $EnrollTarget)
+
+        $ACL.AddAccessRule((New-Object System.DirectoryServices.ActiveDirectoryAccessRule(
+            $Principal, [System.DirectoryServices.ActiveDirectoryRights]::GenericRead,
+            [System.Security.AccessControl.AccessControlType]::Allow,
+            [System.DirectoryServices.ActiveDirectorySecurityInheritance]::None)))
+
+        $ACL.AddAccessRule((New-Object System.DirectoryServices.ActiveDirectoryAccessRule(
+            $Principal, [System.DirectoryServices.ActiveDirectoryRights]::ExtendedRight,
+            [System.Security.AccessControl.AccessControlType]::Allow, $EnrollGUID,
+            [System.DirectoryServices.ActiveDirectorySecurityInheritance]::None)))
+
+        $ACL.AddAccessRule((New-Object System.DirectoryServices.ActiveDirectoryAccessRule(
+            $Principal, [System.DirectoryServices.ActiveDirectoryRights]::ExtendedRight,
+            [System.Security.AccessControl.AccessControlType]::Allow, $AutoEnrollGUID,
+            [System.DirectoryServices.ActiveDirectorySecurityInheritance]::None)))
+    }
+
+    $TemplateObj.ObjectSecurity = $ACL
+    $TemplateObj.CommitChanges()
+}
+
 # Computer 範本：Domain Computers → Enroll + Auto-Enroll
-# （此範本設計上就是要給所有網域電腦做802.1x機器認證用，Domain Computers 是正確範圍）
+# （此範本設計上就是要給所有網域電腦做802.1x機器認證用，Domain Computers 是正確範圍，
+#   繼承而來的 SYSTEM/管理群組權限對此範本不構成額外風險，維持繼承、不做Hardened處理）
 Set-TemplateACL -TemplateName  $Params.ComputerTemplateName `
                 -PrincipalName 'Domain Computers' `
                 -DomainName    $Params.DomainName
-Write-Host "      [OK] $($Params.ComputerTemplateName)：Domain Computers → Read + Enroll + Auto-Enroll" -ForegroundColor Green
+Write-Host "      [OK] $($Params.ComputerTemplateName)：Domain Computers → Read + Enroll + Auto-Enroll（維持繼承）" -ForegroundColor Green
 
-# User 範本：Domain Users → Enroll + Auto-Enroll
-Set-TemplateACL -TemplateName  $Params.UserTemplateName `
-                -PrincipalName 'Domain Users' `
-                -DomainName    $Params.DomainName
-Write-Host "      [OK] $($Params.UserTemplateName)：Domain Users → Read + Enroll + Auto-Enroll" -ForegroundColor Green
+# User 範本：Domain Users → Enroll + Auto-Enroll（Hardened：停用繼承）
+# 【安全性修正】原僅新增Allow規則，未處理繼承而來的SYSTEM/Authenticated Users等規則，
+# 導致CA伺服器本身（ADCS$）能透過繼承的SYSTEM GenericAll規則繞過限制取得User憑證。
+# 已改用Hardened版本，停用繼承，僅保留明確定義的權限清單。
+Set-TemplateACL-Hardened -TemplateName $Params.UserTemplateName `
+    -EnrollPrincipals @('Domain Users') `
+    -FullControlPrincipals @('Domain Admins','Enterprise Admins') `
+    -DomainName $Params.DomainName
+Write-Host "      [OK] $($Params.UserTemplateName)：Domain Users → Read + Enroll + Auto-Enroll（已停用繼承，僅明確清單生效）" -ForegroundColor Green
+Write-Host "      [安全性修正] 已停用繼承，SYSTEM/Authenticated Users等繼承規則不再生效" -ForegroundColor Cyan
 
-# NPS 範本：僅授權 NPS-Servers 專屬群組（最小權限修正，取代原本的 Domain Computers）
-Set-TemplateACL -TemplateName  $Params.NPSTemplateName `
-                -PrincipalName $Params.NPSServersGroupName `
-                -DomainName    $Params.DomainName
-Write-Host "      [OK] $($Params.NPSTemplateName)：$($Params.NPSServersGroupName) → Read + Enroll + Auto-Enroll" -ForegroundColor Green
-Write-Host "      [安全性修正] NPS範本已改為僅授權專屬群組，不再開放給 Domain Computers" -ForegroundColor Cyan
+# NPS 範本：僅授權 NPS-Servers 專屬群組（Hardened：停用繼承）
+# 【安全性修正】同上，原因相同——CA伺服器本身透過繼承的SYSTEM規則取得NPS-Server憑證。
+Set-TemplateACL-Hardened -TemplateName $Params.NPSTemplateName `
+    -EnrollPrincipals @($Params.NPSServersGroupName) `
+    -FullControlPrincipals @('Domain Admins','Enterprise Admins') `
+    -DomainName $Params.DomainName
+Write-Host "      [OK] $($Params.NPSTemplateName)：$($Params.NPSServersGroupName) → Read + Enroll + Auto-Enroll（已停用繼承，僅明確清單生效）" -ForegroundColor Green
+Write-Host "      [安全性修正] NPS範本已改為僅授權專屬群組且停用繼承，SYSTEM/Domain Computers均不再有Enroll權限" -ForegroundColor Cyan
 
 # ── 最終確認：CA 已發布的範本清單 ────────────────────────────
 Write-Host ""
@@ -751,25 +868,23 @@ certutil -config $CAConfig -catemplates
 Write-Host @"
 
 ==================================================
-  憑證範本建立完成！（v5，含安全性修正 + Renewal上限修正 + flags/MACHINE_TYPE修正）
+  憑證範本建立完成！（v6，含安全性修正 + Renewal上限修正 + flags/MACHINE_TYPE修正 + 停用繼承Hardening）
   已建立範本：
-    - $($Params.ComputerTemplateName)（1 年，Renewal 273.75 天/6570小時，電腦 Auto-Enrollment，範圍：Domain Computers，flags含MACHINE_TYPE）
-    - $($Params.UserTemplateName)（2 年，Renewal 547.5 天/13140小時，使用者 Auto-Enrollment，範圍：Domain Users）
+    - $($Params.ComputerTemplateName)（1 年，Renewal 273.75 天/6570小時，電腦 Auto-Enrollment，範圍：Domain Computers，flags含MACHINE_TYPE，維持繼承）
+    - $($Params.UserTemplateName)（2 年，Renewal 547.5 天/13140小時，使用者 Auto-Enrollment，範圍：Domain Users，flags不含MACHINE_TYPE，已停用繼承）
       → NameFlag 已修正為 0x42000000，Subject/SAN 一律由 CA 依 AD 資訊建構
-      → flags 已修正為不含 MACHINE_TYPE，避免核發給電腦身份
-    - $($Params.NPSTemplateName)（2 年，Renewal 547.5 天/13140小時，NPS 伺服器，範圍：$($Params.NPSServersGroupName) 群組，flags含MACHINE_TYPE）
-      → 已限縮權限，僅群組成員可申請，不再開放給所有網域電腦
+      → 已停用繼承，SYSTEM/Authenticated Users等繼承規則不再生效
+    - $($Params.NPSTemplateName)（2 年，Renewal 547.5 天/13140小時，NPS 伺服器，範圍：$($Params.NPSServersGroupName) 群組，flags含MACHINE_TYPE，已停用繼承）
+      → 已限縮權限僅群組成員可申請，且已停用繼承，CA伺服器自身不再能透過SYSTEM規則繞過限制
 
-  【若此前已用舊版腳本核發過憑證，除範本本身外，請務必額外確認】
-    1. Get-ADGroupMember -Identity '$($Params.NPSServersGroupName)'
-       確認群組成員「只有」實際的NPS伺服器電腦帳號，
-       若發現CA伺服器本身或其他非預期電腦也在此群組中，請立即移除
-    2. 確認 $Params.NPSServerComputerNames 陣列內容是否為實際NPS
-       伺服器的正確AD電腦帳號名稱（此前若為預留值 'NPS01','NPS02'
-       未更新，NPS伺服器將無法成功取得憑證）
-    3. 撤銷所有依舊版範本核發的錯誤憑證（含核發給電腦的User憑證、
-       以及核發給非NPS伺服器的NPS-Server憑證），並強制受影響裝置
-       執行 gpupdate /force + certutil -pulse 重新申請
+  【重要驗證】本次修正直接針對「CA伺服器（ADCS）自己拿到User/NPS-Server憑證」
+  這個已知問題設計，請務必在ADCS上實際驗證：
+    1. 撤銷ADCS上先前透過舊版腳本取得的User、NPS-Server憑證（Computer憑證正常，不用撤銷）
+    2. 在ADCS上執行 gpupdate /force + certutil -pulse
+    3. 確認ADCS這次「不會」再取得EAP-TLS-User、EAP-TLS-NPS-Server憑證
+       （EAP-TLS-Computer憑證應正常存在/更新，這是預期行為）
+    4. 在RADIUS1上執行 gpupdate /force + certutil -pulse
+    5. 確認RADIUS1這次能正常取得EAP-TLS-NPS-Server憑證，且Subject/SAN為RADIUS1的FQDN
 
   【重要提醒】若此前已使用舊版 v2 腳本建立過範本並已核發憑證：
     1. 請確認是否已有使用者透過舊版 EAP-TLS-User 範本取得憑證
