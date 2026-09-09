@@ -91,6 +91,18 @@
 #      徹底排除任何未來可能出現的類似繼承漏洞。EAP-TLS-Computer維持
 #      原本的繼承設計，因為該範本本來就開放給所有網域電腦，繼承而
 #      來的權限對它不構成額外風險。
+#
+#    v7（本次修正，重要，修正v6的Hardened函式實際上未生效的問題）：
+#      實測發現 v6 版 Set-TemplateACL-Hardened 使用 [ADSI] 型別加速器
+#      搭配 CommitChanges() 寫入DACL異動時會「靜默失敗」——腳本印出
+#      [OK] 訊息，但實際查詢AD後確認 SetAccessRuleProtection（停用
+#      繼承）與新增的Enroll規則「完全沒有寫入」，導致CA伺服器依然
+#      能透過繼承的SYSTEM規則取得User/NPS-Server憑證，而真正被授權
+#      的NPS-Servers群組成員反而被拒絕（因為Enroll規則也沒寫入）。
+#      已改用 Get-Acl / Set-Acl（AD: 磁碟機）取代 [ADSI]+CommitChanges，
+#      並在寫入後立即重新讀取ACL進行驗證，確認繼承真的被停用、且
+#      指定的Enroll對象真的出現在清單中，任一項未通過會回傳失敗並
+#      印出明確錯誤，不再只憑「沒有拋出例外」就誤判為成功。
 # ============================================================
 
 #region ── 參數區（請依實際環境修改） ────────────────────────
@@ -167,7 +179,7 @@ if (-not (Get-Module -ListAvailable -Name ActiveDirectory)) {
 
 Write-Host ""
 Write-Host "=================================================="  -ForegroundColor Cyan
-Write-Host "  建立 802.1x EAP-TLS 憑證範本 v6"                  -ForegroundColor Cyan
+Write-Host "  建立 802.1x EAP-TLS 憑證範本 v7"                  -ForegroundColor Cyan
 Write-Host "=================================================="  -ForegroundColor Cyan
 Write-Host ""
 
@@ -780,9 +792,18 @@ function Set-TemplateACL-Hardened {
         [string] $DomainName
     )
 
-    $TemplateDN  = "LDAP://CN=$TemplateName,$TemplateBaseDN"
-    $TemplateObj = [ADSI]$TemplateDN
-    $ACL         = $TemplateObj.ObjectSecurity
+    # ── 重要修正：改用 Get-Acl / Set-Acl（AD: 磁碟機），
+    #    不再使用 [ADSI] + CommitChanges()
+    #
+    #  背景：實測發現 [ADSI] 型別加速器搭配 CommitChanges() 在處理
+    #  SetAccessRuleProtection()（停用繼承）這類較複雜的DACL異動時
+    #  會「靜默失敗」——腳本印出 [OK] 訊息，但實際查詢AD後發現ACL
+    #  完全沒有變更，繼承規則依然存在、新增的規則也沒有寫入。
+    #  改用 Get-Acl/Set-Acl 這套PowerShell原生機制（跟本文件先前
+    #  用來讀取/診斷ACL的指令是同一套介面）讀寫一致，較為可靠。
+    #
+    $TemplatePath = "AD:\CN=$TemplateName,$TemplateBaseDN"
+    $ACL = Get-Acl -Path $TemplatePath
 
     # ── 關鍵：停用繼承，且不保留現有繼承規則的副本 ──────────
     $ACL.SetAccessRuleProtection($true, $false)
@@ -828,8 +849,32 @@ function Set-TemplateACL-Hardened {
             [System.DirectoryServices.ActiveDirectorySecurityInheritance]::None)))
     }
 
-    $TemplateObj.ObjectSecurity = $ACL
-    $TemplateObj.CommitChanges()
+    try {
+        Set-Acl -Path $TemplatePath -AclObject $ACL -ErrorAction Stop
+    }
+    catch {
+        Write-Host "    [ERROR] Set-Acl 寫入失敗：$($_.Exception.Message)" -ForegroundColor Red
+        return $false
+    }
+
+    # ── 寫入後立即重新讀取，驗證是否真的生效（不再單純相信CommitChanges的回傳）
+    Start-Sleep -Seconds 2
+    $VerifyACL = Get-Acl -Path $TemplatePath
+    $HasSystem = $VerifyACL.Access | Where-Object { $_.IdentityReference -like '*SYSTEM*' -and $_.ActiveDirectoryRights -match 'GenericAll' }
+    $HasTargetEnroll = foreach ($EnrollTarget in $EnrollPrincipals) {
+        $VerifyACL.Access | Where-Object { $_.IdentityReference -like "*$EnrollTarget*" }
+    }
+
+    if ($HasSystem) {
+        Write-Host "    [ERROR] 驗證失敗：SYSTEM 的繼承規則依然存在，停用繼承未生效！" -ForegroundColor Red
+        return $false
+    }
+    if (-not $HasTargetEnroll) {
+        Write-Host "    [ERROR] 驗證失敗：指定的Enroll對象未出現在ACL中，寫入可能未生效！" -ForegroundColor Red
+        return $false
+    }
+    Write-Host "    [驗證通過] 已確認繼承已停用、Enroll對象已正確寫入" -ForegroundColor Green
+    return $true
 }
 
 # Computer 範本：Domain Computers → Enroll + Auto-Enroll
@@ -844,21 +889,27 @@ Write-Host "      [OK] $($Params.ComputerTemplateName)：Domain Computers → Re
 # 【安全性修正】原僅新增Allow規則，未處理繼承而來的SYSTEM/Authenticated Users等規則，
 # 導致CA伺服器本身（ADCS$）能透過繼承的SYSTEM GenericAll規則繞過限制取得User憑證。
 # 已改用Hardened版本，停用繼承，僅保留明確定義的權限清單。
-Set-TemplateACL-Hardened -TemplateName $Params.UserTemplateName `
+$UserACLOK = Set-TemplateACL-Hardened -TemplateName $Params.UserTemplateName `
     -EnrollPrincipals @('Domain Users') `
     -FullControlPrincipals @('Domain Admins','Enterprise Admins') `
     -DomainName $Params.DomainName
-Write-Host "      [OK] $($Params.UserTemplateName)：Domain Users → Read + Enroll + Auto-Enroll（已停用繼承，僅明確清單生效）" -ForegroundColor Green
-Write-Host "      [安全性修正] 已停用繼承，SYSTEM/Authenticated Users等繼承規則不再生效" -ForegroundColor Cyan
+if ($UserACLOK) {
+    Write-Host "      [OK] $($Params.UserTemplateName)：Domain Users → Read + Enroll + Auto-Enroll（已停用繼承，僅明確清單生效）" -ForegroundColor Green
+} else {
+    Write-Host "      [ERROR] $($Params.UserTemplateName) 的ACL設定失敗或驗證未通過，請手動檢查！" -ForegroundColor Red
+}
 
 # NPS 範本：僅授權 NPS-Servers 專屬群組（Hardened：停用繼承）
 # 【安全性修正】同上，原因相同——CA伺服器本身透過繼承的SYSTEM規則取得NPS-Server憑證。
-Set-TemplateACL-Hardened -TemplateName $Params.NPSTemplateName `
+$NPSACLOK = Set-TemplateACL-Hardened -TemplateName $Params.NPSTemplateName `
     -EnrollPrincipals @($Params.NPSServersGroupName) `
     -FullControlPrincipals @('Domain Admins','Enterprise Admins') `
     -DomainName $Params.DomainName
-Write-Host "      [OK] $($Params.NPSTemplateName)：$($Params.NPSServersGroupName) → Read + Enroll + Auto-Enroll（已停用繼承，僅明確清單生效）" -ForegroundColor Green
-Write-Host "      [安全性修正] NPS範本已改為僅授權專屬群組且停用繼承，SYSTEM/Domain Computers均不再有Enroll權限" -ForegroundColor Cyan
+if ($NPSACLOK) {
+    Write-Host "      [OK] $($Params.NPSTemplateName)：$($Params.NPSServersGroupName) → Read + Enroll + Auto-Enroll（已停用繼承，僅明確清單生效）" -ForegroundColor Green
+} else {
+    Write-Host "      [ERROR] $($Params.NPSTemplateName) 的ACL設定失敗或驗證未通過，請手動檢查！" -ForegroundColor Red
+}
 
 # ── 最終確認：CA 已發布的範本清單 ────────────────────────────
 Write-Host ""
