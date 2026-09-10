@@ -103,6 +103,20 @@
 #      並在寫入後立即重新讀取ACL進行驗證，確認繼承真的被停用、且
 #      指定的Enroll對象真的出現在清單中，任一項未通過會回傳失敗並
 #      印出明確錯誤，不再只憑「沒有拋出例外」就誤判為成功。
+#
+#    v8（本次修正，重要，修正驗證邏輯自身的誤判bug）：
+#      實測發現 v6/v7 新增的 Renewal Period 75%上限自動驗證，因為
+#      計算時使用「已四捨五入成整數天」的 $ActualDays/$ActualRenew
+#      去計算比例（例如273.75天先被顯示成274天，274÷365=75.07%），
+#      導致明明原始Ticks精確換算是剛好75.00%的正確設定，卻被誤判
+#      為「超過75%上限」而觸發[ERROR]，使腳本在完成範本建立與屬性
+#      驗證後直接中止（$AllExist=$false → exit 1），完全沒有機會
+#      執行到後面「發布範本至CA」的步驟——這正是先前「certtmpl.msc
+#      看得到範本、但certsrv.msc看不到」此現象的根本原因，純屬本
+#      腳本驗證邏輯自身的計算誤差，與CA設定或環境無關。
+#      已修正為直接使用原始 $ExpiryTicks / $RenewalTicks 兩個
+#      Int64精確值計算比例，不再經過任何四捨五入的中間步驟，並將
+#      判斷門檻放寬至75.01%作為浮點數運算的合理容差。
 # ============================================================
 
 #region ── 參數區（請依實際環境修改） ────────────────────────
@@ -179,7 +193,7 @@ if (-not (Get-Module -ListAvailable -Name ActiveDirectory)) {
 
 Write-Host ""
 Write-Host "=================================================="  -ForegroundColor Cyan
-Write-Host "  建立 802.1x EAP-TLS 憑證範本 v7"                  -ForegroundColor Cyan
+Write-Host "  建立 802.1x EAP-TLS 憑證範本 v8"                  -ForegroundColor Cyan
 Write-Host "=================================================="  -ForegroundColor Cyan
 Write-Host ""
 
@@ -573,8 +587,8 @@ $AllExist = $true
         Write-Host ""
         Write-Host "  [$TemplateName]" -ForegroundColor Cyan
         Write-Host "    有效期       ：$ActualDays 天（預期 $ExpectDays 天）" -ForegroundColor $(if ($ActualDays -eq $ExpectDays) {'Green'} else {'Red'})
-        $RenewRatio = [Math]::Round(($ActualRenew / $ActualDays) * 100, 1)
-        Write-Host "    更新期       ：$ActualRenew 天前開始更新（佔有效期 $RenewRatio%）" -ForegroundColor $(if ($RenewRatio -le 75) {'Gray'} else {'Red'})
+        $RenewRatio = [Math]::Round(([Math]::Abs($RenewalTicks) / [Math]::Abs($ExpiryTicks)) * 100, 2)
+        Write-Host "    更新期       ：$ActualRenew 天前開始更新（精確佔比 $RenewRatio%，顯示天數已四捨五入僅供參考）" -ForegroundColor $(if ($RenewRatio -le 75.01) {'Gray'} else {'Red'})
         Write-Host "    最小金鑰長度 ：$($Obj.'msPKI-Minimal-Key-Size') bits" -ForegroundColor Gray
         Write-Host "    申請旗標     ：0x$($Obj.'msPKI-Enrollment-Flag'.ToString('X'))" -ForegroundColor Gray
         Write-Host "    主體名稱旗標 ：0x$($Obj.'msPKI-Certificate-Name-Flag'.ToString('X'))" -ForegroundColor Gray
@@ -585,7 +599,7 @@ $AllExist = $true
             $AllExist = $false
         }
 
-        if ($RenewRatio -gt 75) {
+        if ($RenewRatio -gt 75.01) {
             Write-Host "    [ERROR] Renewal Period 超過 CA 允許的 75% 上限，MMC編輯時會被強制修正！請檢查 Ticks 計算。" -ForegroundColor Red
             $AllExist = $false
         }
@@ -919,7 +933,7 @@ certutil -config $CAConfig -catemplates
 Write-Host @"
 
 ==================================================
-  憑證範本建立完成！（v6，含安全性修正 + Renewal上限修正 + flags/MACHINE_TYPE修正 + 停用繼承Hardening）
+  憑證範本建立完成！（v8，含安全性修正 + Renewal上限修正 + flags/MACHINE_TYPE修正 + 停用繼承Hardening + 驗證誤判修正）
   已建立範本：
     - $($Params.ComputerTemplateName)（1 年，Renewal 273.75 天/6570小時，電腦 Auto-Enrollment，範圍：Domain Computers，flags含MACHINE_TYPE，維持繼承）
     - $($Params.UserTemplateName)（2 年，Renewal 547.5 天/13140小時，使用者 Auto-Enrollment，範圍：Domain Users，flags不含MACHINE_TYPE，已停用繼承）
