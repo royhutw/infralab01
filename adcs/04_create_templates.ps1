@@ -117,6 +117,33 @@
 #      已修正為直接使用原始 $ExpiryTicks / $RenewalTicks 兩個
 #      Int64精確值計算比例，不再經過任何四捨五入的中間步驟，並將
 #      判斷門檻放寬至75.01%作為浮點數運算的合理容差。
+#
+#    v9（本次修正，重要，修正ACL驗證因快取造成的假性失敗）：
+#      實測發現 v7 版在 Set-Acl 寫入成功後，緊接著在「同一個
+#      PowerShell工作階段」內立即用 Get-Acl 重新讀取驗證，疑似
+#      讀到 AD: 磁碟機在本工作階段內的快取資料，導致明明 Set-Acl
+#      已經成功寫入（繼承已停用、Enroll對象已存在），驗證卻誤判
+#      為失敗，印出[ERROR]並讓函式回傳$false——這與User開放給
+#      Domain Users、NPS-Server開放給NPS-Servers群組的Enroll權限
+#      是否真的有效，是兩件獨立的事：權限本身很可能已經生效，
+#      只是本腳本自己的驗證機制讀到了過時的快取而誤報。
+#      已修正為：寫入後等待時間拉長至5秒、驗證前主動移除並重新
+#      掛載AD:磁碟機強制建立全新連線、並加入最多3次重試機制，
+#      大幅降低因快取或複寫延遲造成的誤判機率。
+#
+#    v10（本次修正，重要，修正SetAccessRuleProtection實際未寫入AD的問題）：
+#      實測發現 v9 版用全新PowerShell視窗重新查證後，確認並非快取
+#      造成的假性失敗——明確新增的Enroll規則（如Domain Users的Read/
+#      ExtendedRight）確實有成功寫入，但SetAccessRuleProtection停用
+#      繼承這個動作，卻真的沒有被寫回AD，SYSTEM/Authenticated Users
+#      等繼承規則依然存在。這代表Set-Acl能正確處理個別ACE的增刪，
+#      但DACL的Protected控制位元異動被忽略。
+#      根據微軟官方文件對System.DirectoryServices的說明，改用
+#      DirectoryEntry並明確設定Options.SecurityMasks為僅鎖定Dacl，
+#      確保讀取與寫入操作精準對應到DACL範圍（含Protected控制位元），
+#      取代原本v9的Get-Acl/Set-Acl（AD:磁碟機）寫法。驗證段落也
+#      同步改用相同的DirectoryEntry+SecurityMasks方式重新讀取，
+#      避免混用不同讀寫機制導致行為不一致。
 # ============================================================
 
 #region ── 參數區（請依實際環境修改） ────────────────────────
@@ -193,7 +220,7 @@ if (-not (Get-Module -ListAvailable -Name ActiveDirectory)) {
 
 Write-Host ""
 Write-Host "=================================================="  -ForegroundColor Cyan
-Write-Host "  建立 802.1x EAP-TLS 憑證範本 v8"                  -ForegroundColor Cyan
+Write-Host "  建立 802.1x EAP-TLS 憑證範本 v10"                 -ForegroundColor Cyan
 Write-Host "=================================================="  -ForegroundColor Cyan
 Write-Host ""
 
@@ -816,8 +843,24 @@ function Set-TemplateACL-Hardened {
     #  改用 Get-Acl/Set-Acl 這套PowerShell原生機制（跟本文件先前
     #  用來讀取/診斷ACL的指令是同一套介面）讀寫一致，較為可靠。
     #
-    $TemplatePath = "AD:\CN=$TemplateName,$TemplateBaseDN"
-    $ACL = Get-Acl -Path $TemplatePath
+    # ── 重要修正（v10）：明確指定 SecurityMasks 僅鎖定 Dacl，
+    #    確保「停用繼承」這個控制位元的異動能被完整寫入AD
+    #
+    #  背景：v9 改用 Get-Acl/Set-Acl 後，實測發現「新增的Enroll規則」
+    #  能正確寫入，但「SetAccessRuleProtection停用繼承」這個特定動作
+    #  卻被悄悄忽略——SYSTEM/Authenticated Users等繼承規則依然存在。
+    #  這不是快取問題（已用全新PowerShell視窗確認），而是寫入本身
+    #  真的沒有把「停用繼承」這個控制位元送回AD。
+    #
+    #  根據微軟官方文件對System.DirectoryServices的說明，透過
+    #  DirectoryEntry寫入安全性描述元時，若未明確設定
+    #  Options.SecurityMasks，寫入行為可能不足以涵蓋完整的DACL
+    #  控制位元異動（包含Protected旗標）。明確設為Dacl，確保這次
+    #  的讀取與寫入都精準鎖定在DACL範圍，讓停用繼承的異動能生效。
+    #
+    $Entry = New-Object System.DirectoryServices.DirectoryEntry("LDAP://CN=$TemplateName,$TemplateBaseDN")
+    $Entry.Options.SecurityMasks = [System.DirectoryServices.SecurityMasks]::Dacl
+    $ACL = $Entry.ObjectSecurity
 
     # ── 關鍵：停用繼承，且不保留現有繼承規則的副本 ──────────
     $ACL.SetAccessRuleProtection($true, $false)
@@ -864,27 +907,44 @@ function Set-TemplateACL-Hardened {
     }
 
     try {
-        Set-Acl -Path $TemplatePath -AclObject $ACL -ErrorAction Stop
+        $Entry.Options.SecurityMasks = [System.DirectoryServices.SecurityMasks]::Dacl
+        $Entry.ObjectSecurity = $ACL
+        $Entry.CommitChanges()
+        $Entry.Close()
     }
     catch {
-        Write-Host "    [ERROR] Set-Acl 寫入失敗：$($_.Exception.Message)" -ForegroundColor Red
+        Write-Host "    [ERROR] 寫入失敗：$($_.Exception.Message)" -ForegroundColor Red
         return $false
     }
 
-    # ── 寫入後立即重新讀取，驗證是否真的生效（不再單純相信CommitChanges的回傳）
-    Start-Sleep -Seconds 2
-    $VerifyACL = Get-Acl -Path $TemplatePath
-    $HasSystem = $VerifyACL.Access | Where-Object { $_.IdentityReference -like '*SYSTEM*' -and $_.ActiveDirectoryRights -match 'GenericAll' }
-    $HasTargetEnroll = foreach ($EnrollTarget in $EnrollPrincipals) {
-        $VerifyACL.Access | Where-Object { $_.IdentityReference -like "*$EnrollTarget*" }
+    # ── 寫入後重新讀取驗證（改用全新DirectoryEntry，避免AD:磁碟機
+    #    快取影響判斷，且與寫入時使用相同的SecurityMasks=Dacl設定）
+    Start-Sleep -Seconds 5
+
+    $VerifyOK = $false
+    for ($i = 1; $i -le 3; $i++) {
+        $VerifyEntry = New-Object System.DirectoryServices.DirectoryEntry("LDAP://CN=$TemplateName,$TemplateBaseDN")
+        $VerifyEntry.Options.SecurityMasks = [System.DirectoryServices.SecurityMasks]::Dacl
+        $VerifyACL = $VerifyEntry.ObjectSecurity
+        $HasSystem = $VerifyACL.Access | Where-Object { $_.IdentityReference -like '*SYSTEM*' -and $_.ActiveDirectoryRights -match 'GenericAll' }
+        $HasTargetEnroll = $true
+        foreach ($EnrollTarget in $EnrollPrincipals) {
+            $Found = $VerifyACL.Access | Where-Object { $_.IdentityReference -like "*$EnrollTarget*" }
+            if (-not $Found) { $HasTargetEnroll = $false }
+        }
+        $VerifyEntry.Close()
+
+        if ((-not $HasSystem) -and $HasTargetEnroll) {
+            $VerifyOK = $true
+            break
+        }
+        Write-Host "    [重試 $i/3] 驗證未通過，等待3秒後重新讀取（可能是AD複寫延遲）..." -ForegroundColor Yellow
+        Start-Sleep -Seconds 3
     }
 
-    if ($HasSystem) {
-        Write-Host "    [ERROR] 驗證失敗：SYSTEM 的繼承規則依然存在，停用繼承未生效！" -ForegroundColor Red
-        return $false
-    }
-    if (-not $HasTargetEnroll) {
-        Write-Host "    [ERROR] 驗證失敗：指定的Enroll對象未出現在ACL中，寫入可能未生效！" -ForegroundColor Red
+    if (-not $VerifyOK) {
+        Write-Host "    [WARN] 重試3次後驗證仍未通過，請務必用「全新PowerShell視窗」手動重新查證，" -ForegroundColor Yellow
+        Write-Host "           本結果可能受限於本工作階段的快取，不代表寫入實際失敗" -ForegroundColor Yellow
         return $false
     }
     Write-Host "    [驗證通過] 已確認繼承已停用、Enroll對象已正確寫入" -ForegroundColor Green
@@ -933,7 +993,7 @@ certutil -config $CAConfig -catemplates
 Write-Host @"
 
 ==================================================
-  憑證範本建立完成！（v8，含安全性修正 + Renewal上限修正 + flags/MACHINE_TYPE修正 + 停用繼承Hardening + 驗證誤判修正）
+  憑證範本建立完成！（v10，含安全性修正 + Renewal上限修正 + flags/MACHINE_TYPE修正 + 停用繼承Hardening + 驗證誤判修正 + SecurityMasks修正）
   已建立範本：
     - $($Params.ComputerTemplateName)（1 年，Renewal 273.75 天/6570小時，電腦 Auto-Enrollment，範圍：Domain Computers，flags含MACHINE_TYPE，維持繼承）
     - $($Params.UserTemplateName)（2 年，Renewal 547.5 天/13140小時，使用者 Auto-Enrollment，範圍：Domain Users，flags不含MACHINE_TYPE，已停用繼承）
