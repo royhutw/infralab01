@@ -144,11 +144,29 @@
 #      取代原本v9的Get-Acl/Set-Acl（AD:磁碟機）寫法。驗證段落也
 #      同步改用相同的DirectoryEntry+SecurityMasks方式重新讀取，
 #      避免混用不同讀寫機制導致行為不一致。
+#
+#    v11（本次修正，重要，捨棄.NET物件模型，改用dsacls.exe）：
+#      實測發現 v10 的 DirectoryEntry+Options.SecurityMasks 寫法，
+#      在本環境（Windows PowerShell 5.1 Desktop）直接拋出「屬性
+#      不存在」的例外。至此，三種獨立的.NET/COM介面寫法
+#      （[ADSI]+CommitChanges、Get-Acl/Set-Acl、DirectoryEntry+
+#      SecurityMasks）都各自在「停用繼承」這個特定操作上失敗，
+#      顯示問題出在本環境的.NET/COM interop層級，而非個別寫法的
+#      細節錯誤，不宜再於同一條路上排查。
+#      已改用 dsacls.exe——Windows內建、獨立於.NET物件模型、專門
+#      管理AD物件權限的命令列工具，經查證微軟官方文件確認 /P:Y
+#      是設定「物件保護狀態（停用繼承）」的標準做法。
+#      並修正執行順序：必須先執行/P:Y讓繼承規則轉為顯式副本，
+#      再用/R移除SYSTEM/Authenticated Users（若順序顛倒，此時
+#      這些規則仍是繼承而來、非此物件自身的顯式ACE，/R會找不到
+#      可移除的對象）。新增 NetBIOSDomainName 參數（dsacls要求
+#      NetBIOS格式的網域名稱，與LDAP的FQDN格式DomainName不同）。
 # ============================================================
 
 #region ── 參數區（請依實際環境修改） ────────────────────────
 $Params = @{
     DomainName      = 'corp.foo.bar.tw'
+    NetBIOSDomainName = 'CORP'   # ← dsacls需要NetBIOS格式網域名稱，請依實際環境修改
     DomainDN        = 'DC=corp,DC=foo,DC=bar,DC=tw'
 
     # ── 來源範本名稱（內建範本，複製基礎用）────────────────
@@ -220,7 +238,7 @@ if (-not (Get-Module -ListAvailable -Name ActiveDirectory)) {
 
 Write-Host ""
 Write-Host "=================================================="  -ForegroundColor Cyan
-Write-Host "  建立 802.1x EAP-TLS 憑證範本 v10"                 -ForegroundColor Cyan
+Write-Host "  建立 802.1x EAP-TLS 憑證範本 v11"                 -ForegroundColor Cyan
 Write-Host "=================================================="  -ForegroundColor Cyan
 Write-Host ""
 
@@ -830,111 +848,98 @@ function Set-TemplateACL-Hardened {
         [array]  $EnrollPrincipals,       # 可以 Enroll+Autoenroll 的對象清單
         [array]  $ReadOnlyPrincipals = @(), # 僅需 Read（查看/稽核用途）的對象清單
         [array]  $FullControlPrincipals,  # 需要完整管理權限的對象（管理群組）
-        [string] $DomainName
+        [string] $NetBIOSDomain            # NetBIOS格式網域名稱（如 'CORP'），dsacls要求此格式
     )
 
-    # ── 重要修正：改用 Get-Acl / Set-Acl（AD: 磁碟機），
-    #    不再使用 [ADSI] + CommitChanges()
+    # ── 重要修正（v11）：改用 dsacls.exe，捨棄 .NET DirectoryServices 物件模型
     #
-    #  背景：實測發現 [ADSI] 型別加速器搭配 CommitChanges() 在處理
-    #  SetAccessRuleProtection()（停用繼承）這類較複雜的DACL異動時
-    #  會「靜默失敗」——腳本印出 [OK] 訊息，但實際查詢AD後發現ACL
-    #  完全沒有變更，繼承規則依然存在、新增的規則也沒有寫入。
-    #  改用 Get-Acl/Set-Acl 這套PowerShell原生機制（跟本文件先前
-    #  用來讀取/診斷ACL的指令是同一套介面）讀寫一致，較為可靠。
+    #  背景：v6～v10 陸續嘗試了 [ADSI]+CommitChanges()、Get-Acl/Set-Acl
+    #  （AD:磁碟機）、DirectoryEntry+Options.SecurityMasks 三種不同的
+    #  .NET/COM介面寫法，全部都在「停用繼承」（SetAccessRuleProtection）
+    #  這個特定操作上失敗或出現非預期行為（有的整段靜默失敗、有的能
+    #  寫入個別ACE卻漏了Protected控制位元、有的則是PowerShell無法
+    #  正確透過COM interop存取.Options.SecurityMasks屬性）。三種獨立
+    #  的.NET寫法都卡在同一個操作上，顯示問題可能出在這個環境的
+    #  PowerShell/.NET/COM interop層級，而非個別寫法的細節錯誤。
     #
-    # ── 重要修正（v10）：明確指定 SecurityMasks 僅鎖定 Dacl，
-    #    確保「停用繼承」這個控制位元的異動能被完整寫入AD
+    #  改用 dsacls.exe——Windows內建、歷史悠久、專門用於AD物件權限
+    #  管理的命令列工具，不透過.NET DirectoryServices物件模型，直接
+    #  呼叫底層AD API，可靠性不受前述.NET/COM interop問題影響。
     #
-    #  背景：v9 改用 Get-Acl/Set-Acl 後，實測發現「新增的Enroll規則」
-    #  能正確寫入，但「SetAccessRuleProtection停用繼承」這個特定動作
-    #  卻被悄悄忽略——SYSTEM/Authenticated Users等繼承規則依然存在。
-    #  這不是快取問題（已用全新PowerShell視窗確認），而是寫入本身
-    #  真的沒有把「停用繼承」這個控制位元送回AD。
+    #  dsacls關鍵參數說明：
+    #    /P:Y     停用繼承（等同GUI取消勾選「Include inheritable
+    #             permissions from this object's parent」）
+    #    /R       移除指定對象的所有既有ACE
+    #    /G       授予權限，GA=Generic All、GR=Generic Read、
+    #             CA;<GUID>=Control Access（即Enroll/Autoenroll這類
+    #             Extended Right）
     #
-    #  根據微軟官方文件對System.DirectoryServices的說明，透過
-    #  DirectoryEntry寫入安全性描述元時，若未明確設定
-    #  Options.SecurityMasks，寫入行為可能不足以涵蓋完整的DACL
-    #  控制位元異動（包含Protected旗標）。明確設為Dacl，確保這次
-    #  的讀取與寫入都精準鎖定在DACL範圍，讓停用繼承的異動能生效。
-    #
-    $Entry = New-Object System.DirectoryServices.DirectoryEntry("LDAP://CN=$TemplateName,$TemplateBaseDN")
-    $Entry.Options.SecurityMasks = [System.DirectoryServices.SecurityMasks]::Dacl
-    $ACL = $Entry.ObjectSecurity
+    $TemplateDN        = "CN=$TemplateName,$TemplateBaseDN"
+    $EnrollGUIDStr     = '0e10c968-78fb-11d2-90d4-00c04f79dc55'
+    $AutoEnrollGUIDStr = 'a05b8cc2-17bc-4802-a710-e7c15ab866a2'
 
-    # ── 關鍵：停用繼承，且不保留現有繼承規則的副本 ──────────
-    $ACL.SetAccessRuleProtection($true, $false)
+    # ── 重要：執行順序 ──────────────────────────────────────
+    # 必須先停用繼承（/P:Y），讓原本「繼承而來」的規則轉為此物件
+    # 自己的「顯式副本」，之後 /R 才移除得掉——若順序顛倒，繼承規則
+    # 此時還不屬於這個物件自己的ACE，/R會找不到對象可移除。
 
-    # ── 明確授予管理群組 Full Control（取代原本繼承而來的） ──
-    foreach ($AdminGroup in $FullControlPrincipals) {
-        $Principal = New-Object System.Security.Principal.NTAccount($DomainName, $AdminGroup)
-        $ACE_Full  = New-Object System.DirectoryServices.ActiveDirectoryAccessRule(
-            $Principal,
-            [System.DirectoryServices.ActiveDirectoryRights]::GenericAll,
-            [System.Security.AccessControl.AccessControlType]::Allow,
-            [System.DirectoryServices.ActiveDirectorySecurityInheritance]::None
-        )
-        $ACL.AddAccessRule($ACE_Full)
-    }
-
-    # ── 僅 Read（查看/稽核用途，無法申請憑證、無法編輯）────────
-    foreach ($ReadTarget in $ReadOnlyPrincipals) {
-        $Principal = New-Object System.Security.Principal.NTAccount($DomainName, $ReadTarget)
-        $ACL.AddAccessRule((New-Object System.DirectoryServices.ActiveDirectoryAccessRule(
-            $Principal, [System.DirectoryServices.ActiveDirectoryRights]::GenericRead,
-            [System.Security.AccessControl.AccessControlType]::Allow,
-            [System.DirectoryServices.ActiveDirectorySecurityInheritance]::None)))
-    }
-
-    # ── 明確授予指定對象 Read + Enroll + Autoenroll ──────────
-    foreach ($EnrollTarget in $EnrollPrincipals) {
-        $Principal = New-Object System.Security.Principal.NTAccount($DomainName, $EnrollTarget)
-
-        $ACL.AddAccessRule((New-Object System.DirectoryServices.ActiveDirectoryAccessRule(
-            $Principal, [System.DirectoryServices.ActiveDirectoryRights]::GenericRead,
-            [System.Security.AccessControl.AccessControlType]::Allow,
-            [System.DirectoryServices.ActiveDirectorySecurityInheritance]::None)))
-
-        $ACL.AddAccessRule((New-Object System.DirectoryServices.ActiveDirectoryAccessRule(
-            $Principal, [System.DirectoryServices.ActiveDirectoryRights]::ExtendedRight,
-            [System.Security.AccessControl.AccessControlType]::Allow, $EnrollGUID,
-            [System.DirectoryServices.ActiveDirectorySecurityInheritance]::None)))
-
-        $ACL.AddAccessRule((New-Object System.DirectoryServices.ActiveDirectoryAccessRule(
-            $Principal, [System.DirectoryServices.ActiveDirectoryRights]::ExtendedRight,
-            [System.Security.AccessControl.AccessControlType]::Allow, $AutoEnrollGUID,
-            [System.DirectoryServices.ActiveDirectorySecurityInheritance]::None)))
-    }
-
-    try {
-        $Entry.Options.SecurityMasks = [System.DirectoryServices.SecurityMasks]::Dacl
-        $Entry.ObjectSecurity = $ACL
-        $Entry.CommitChanges()
-        $Entry.Close()
-    }
-    catch {
-        Write-Host "    [ERROR] 寫入失敗：$($_.Exception.Message)" -ForegroundColor Red
+    # 1. 停用繼承（關鍵動作，繼承規則會先轉為顯式副本保留）
+    $ProtectOutput = dsacls "$TemplateDN" /P:Y 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "    [ERROR] dsacls /P:Y 停用繼承失敗：$ProtectOutput" -ForegroundColor Red
         return $false
     }
 
-    # ── 寫入後重新讀取驗證（改用全新DirectoryEntry，避免AD:磁碟機
-    #    快取影響判斷，且與寫入時使用相同的SecurityMasks=Dacl設定）
+    # 2. 移除轉為顯式後的 SYSTEM / Authenticated Users 規則
+    dsacls "$TemplateDN" /R "NT AUTHORITY\SYSTEM" 2>&1 | Out-Null
+    dsacls "$TemplateDN" /R "NT AUTHORITY\Authenticated Users" 2>&1 | Out-Null
+
+    # 3. 授予管理群組 Full Control
+    foreach ($AdminGroup in $FullControlPrincipals) {
+        $Output = dsacls "$TemplateDN" /G "${NetBIOSDomain}\${AdminGroup}:GA" 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "    [ERROR] 授予 $AdminGroup Full Control 失敗：$Output" -ForegroundColor Red
+            return $false
+        }
+    }
+
+    # 4. 授予僅 Read 的對象
+    foreach ($ReadTarget in $ReadOnlyPrincipals) {
+        dsacls "$TemplateDN" /G "${NetBIOSDomain}\${ReadTarget}:GR" 2>&1 | Out-Null
+    }
+
+    # 5. 授予 Read + Enroll + Autoenroll
+    foreach ($EnrollTarget in $EnrollPrincipals) {
+        $R1 = dsacls "$TemplateDN" /G "${NetBIOSDomain}\${EnrollTarget}:GR" 2>&1
+        $R2 = dsacls "$TemplateDN" /G "${NetBIOSDomain}\${EnrollTarget}:CA;$EnrollGUIDStr" 2>&1
+        $R3 = dsacls "$TemplateDN" /G "${NetBIOSDomain}\${EnrollTarget}:CA;$AutoEnrollGUIDStr" 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "    [ERROR] 授予 $EnrollTarget Enroll/Autoenroll 權限失敗" -ForegroundColor Red
+            Write-Host "      $R1" -ForegroundColor Red
+            Write-Host "      $R2" -ForegroundColor Red
+            Write-Host "      $R3" -ForegroundColor Red
+            return $false
+        }
+    }
+
+    # ── 寫入後重新讀取驗證（改用已驗證可靠的Get-Acl讀取方式，
+    #    精確比對SYSTEM的GenericAll是否消失、指定Enroll對象是否存在，
+    #    而非僅粗略比對輸出字串中有沒有出現"SYSTEM"字樣）
     Start-Sleep -Seconds 5
 
     $VerifyOK = $false
     for ($i = 1; $i -le 3; $i++) {
-        $VerifyEntry = New-Object System.DirectoryServices.DirectoryEntry("LDAP://CN=$TemplateName,$TemplateBaseDN")
-        $VerifyEntry.Options.SecurityMasks = [System.DirectoryServices.SecurityMasks]::Dacl
-        $VerifyACL = $VerifyEntry.ObjectSecurity
-        $HasSystem = $VerifyACL.Access | Where-Object { $_.IdentityReference -like '*SYSTEM*' -and $_.ActiveDirectoryRights -match 'GenericAll' }
+        $VerifyAccess = (Get-Acl "AD:\$TemplateDN").Access
+        $HasSystemFullControl = $VerifyAccess | Where-Object {
+            $_.IdentityReference -like '*SYSTEM*' -and $_.ActiveDirectoryRights -match 'GenericAll'
+        }
         $HasTargetEnroll = $true
         foreach ($EnrollTarget in $EnrollPrincipals) {
-            $Found = $VerifyACL.Access | Where-Object { $_.IdentityReference -like "*$EnrollTarget*" }
+            $Found = $VerifyAccess | Where-Object { $_.IdentityReference -like "*$EnrollTarget*" }
             if (-not $Found) { $HasTargetEnroll = $false }
         }
-        $VerifyEntry.Close()
 
-        if ((-not $HasSystem) -and $HasTargetEnroll) {
+        if ((-not $HasSystemFullControl) -and $HasTargetEnroll) {
             $VerifyOK = $true
             break
         }
@@ -943,11 +948,11 @@ function Set-TemplateACL-Hardened {
     }
 
     if (-not $VerifyOK) {
-        Write-Host "    [WARN] 重試3次後驗證仍未通過，請務必用「全新PowerShell視窗」手動重新查證，" -ForegroundColor Yellow
-        Write-Host "           本結果可能受限於本工作階段的快取，不代表寫入實際失敗" -ForegroundColor Yellow
+        Write-Host "    [WARN] 重試3次後驗證仍未通過，請用「全新PowerShell視窗」手動執行以下指令查證：" -ForegroundColor Yellow
+        Write-Host "           (Get-Acl `"AD:\$TemplateDN`").Access | Select IdentityReference,ActiveDirectoryRights,AccessControlType" -ForegroundColor Yellow
         return $false
     }
-    Write-Host "    [驗證通過] 已確認繼承已停用、Enroll對象已正確寫入" -ForegroundColor Green
+    Write-Host "    [驗證通過] 已確認SYSTEM的GenericAll已移除、指定Enroll對象已正確寫入" -ForegroundColor Green
     return $true
 }
 
@@ -966,7 +971,7 @@ Write-Host "      [OK] $($Params.ComputerTemplateName)：Domain Computers → Re
 $UserACLOK = Set-TemplateACL-Hardened -TemplateName $Params.UserTemplateName `
     -EnrollPrincipals @('Domain Users') `
     -FullControlPrincipals @('Domain Admins','Enterprise Admins') `
-    -DomainName $Params.DomainName
+    -NetBIOSDomain $Params.NetBIOSDomainName
 if ($UserACLOK) {
     Write-Host "      [OK] $($Params.UserTemplateName)：Domain Users → Read + Enroll + Auto-Enroll（已停用繼承，僅明確清單生效）" -ForegroundColor Green
 } else {
@@ -978,7 +983,7 @@ if ($UserACLOK) {
 $NPSACLOK = Set-TemplateACL-Hardened -TemplateName $Params.NPSTemplateName `
     -EnrollPrincipals @($Params.NPSServersGroupName) `
     -FullControlPrincipals @('Domain Admins','Enterprise Admins') `
-    -DomainName $Params.DomainName
+    -NetBIOSDomain $Params.NetBIOSDomainName
 if ($NPSACLOK) {
     Write-Host "      [OK] $($Params.NPSTemplateName)：$($Params.NPSServersGroupName) → Read + Enroll + Auto-Enroll（已停用繼承，僅明確清單生效）" -ForegroundColor Green
 } else {
@@ -993,7 +998,7 @@ certutil -config $CAConfig -catemplates
 Write-Host @"
 
 ==================================================
-  憑證範本建立完成！（v10，含安全性修正 + Renewal上限修正 + flags/MACHINE_TYPE修正 + 停用繼承Hardening + 驗證誤判修正 + SecurityMasks修正）
+  憑證範本建立完成！（v11，含安全性修正 + Renewal上限修正 + flags/MACHINE_TYPE修正 + 停用繼承Hardening[dsacls] + 驗證誤判修正）
   已建立範本：
     - $($Params.ComputerTemplateName)（1 年，Renewal 273.75 天/6570小時，電腦 Auto-Enrollment，範圍：Domain Computers，flags含MACHINE_TYPE，維持繼承）
     - $($Params.UserTemplateName)（2 年，Renewal 547.5 天/13140小時，使用者 Auto-Enrollment，範圍：Domain Users，flags不含MACHINE_TYPE，已停用繼承）
