@@ -161,6 +161,29 @@
 #      這些規則仍是繼承而來、非此物件自身的顯式ACE，/R會找不到
 #      可移除的對象）。新增 NetBIOSDomainName 參數（dsacls要求
 #      NetBIOS格式的網域名稱，與LDAP的FQDN格式DomainName不同）。
+#
+#    v12（本次修正，修正dsacls的Enroll/Autoenroll參數格式錯誤）：
+#      實測發現 v11 版的 /P:Y（停用繼承）、/R（移除SYSTEM/
+#      Authenticated Users）、/G（授予Full Control/Read）全部
+#      成功，唯獨 Enroll/Autoenroll 這兩個Extended Right授權失敗，
+#      dsacls回報「No GUID Found for <GUID字串>」。根本原因是
+#      dsacls的 CA;<name> 語法，<name>必須是已註冊的「顯示名稱」
+#      （如Enroll、AutoEnrollment），不接受直接傳入原始GUID字串。
+#      已將 CA;$EnrollGUIDStr / CA;$AutoEnrollGUIDStr 改為
+#      CA;Enroll / CA;AutoEnrollment。
+#
+#    v13（本次修正，重要，修正Hardening做過頭導致CA自己都讀不到範本）：
+#      實測發現Hardened後的範本（僅Domain Admins/Enterprise Admins/
+#      指定Enroll對象）雖然權限設計上正確，卻導致CA伺服器自己執行
+#      certutil -SetCATemplates時回報「Element not found」——CA伺服器
+#      的電腦帳號本身不屬於Domain Admins/Enterprise Admins，也不是
+#      Domain Users/NPS-Servers成員，導致CA連「看得到範本物件存在」
+#      的最基本Read權限都沒有，對CA而言此物件形同不存在。
+#      微軟內建範本預設都會保留Authenticated Users的Read權限，
+#      用意正是確保CA伺服器與任何嘗試申請的用戶端至少能讀取範本
+#      內容——真正該收斂的是Enroll（誰能申請），而非Read（誰能
+#      看到範本存在）。已在Read權限清單中加回Authenticated Users，
+#      Enroll/Autoenroll權限則維持原本收斂的範圍不變。
 # ============================================================
 
 #region ── 參數區（請依實際環境修改） ────────────────────────
@@ -238,7 +261,7 @@ if (-not (Get-Module -ListAvailable -Name ActiveDirectory)) {
 
 Write-Host ""
 Write-Host "=================================================="  -ForegroundColor Cyan
-Write-Host "  建立 802.1x EAP-TLS 憑證範本 v11"                 -ForegroundColor Cyan
+Write-Host "  建立 802.1x EAP-TLS 憑證範本 v13"                 -ForegroundColor Cyan
 Write-Host "=================================================="  -ForegroundColor Cyan
 Write-Host ""
 
@@ -875,8 +898,9 @@ function Set-TemplateACL-Hardened {
     #             Extended Right）
     #
     $TemplateDN        = "CN=$TemplateName,$TemplateBaseDN"
-    $EnrollGUIDStr     = '0e10c968-78fb-11d2-90d4-00c04f79dc55'
-    $AutoEnrollGUIDStr = 'a05b8cc2-17bc-4802-a710-e7c15ab866a2'
+    # 參考：Enroll的Rights-GUID為0e10c968-78fb-11d2-90d4-00c04f79dc55，
+    # Autoenroll的Rights-GUID為a05b8cc2-17bc-4802-a710-e7c15ab866a2，
+    # 但dsacls實際指令需使用下方的顯示名稱 Enroll / AutoEnrollment，不接受GUID字串
 
     # ── 重要：執行順序 ──────────────────────────────────────
     # 必須先停用繼承（/P:Y），讓原本「繼承而來」的規則轉為此物件
@@ -903,16 +927,25 @@ function Set-TemplateACL-Hardened {
         }
     }
 
-    # 4. 授予僅 Read 的對象
+    # 4. 授予僅 Read 的對象（含 Authenticated Users，確保CA本身
+    #    以及任何嘗試申請的用戶端，至少都能讀取到範本存在與其內容
+    #    ——這是CA伺服器正常運作Autoenrollment所必須的最低權限，
+    #    Read不等於Enroll，不影響「誰能實際申請」這個安全目標）
+    #    注意：Authenticated Users是內建知名主體，不需要NetBIOS網域前綴；
+    #    $ReadOnlyPrincipals若日後填入自訂網域群組，則需要前綴。
+    dsacls "$TemplateDN" /G "Authenticated Users:GR" 2>&1 | Out-Null
     foreach ($ReadTarget in $ReadOnlyPrincipals) {
         dsacls "$TemplateDN" /G "${NetBIOSDomain}\${ReadTarget}:GR" 2>&1 | Out-Null
     }
 
     # 5. 授予 Read + Enroll + Autoenroll
+    #    重要：dsacls的 CA; 後面要接「顯示名稱」，不接受原始GUID字串
+    #    （實測 CA;0e10c968-...  會回報 "No GUID Found"，
+    #      必須用 CA;Enroll 與 CA;AutoEnrollment 這兩個已註冊的顯示名稱）
     foreach ($EnrollTarget in $EnrollPrincipals) {
         $R1 = dsacls "$TemplateDN" /G "${NetBIOSDomain}\${EnrollTarget}:GR" 2>&1
-        $R2 = dsacls "$TemplateDN" /G "${NetBIOSDomain}\${EnrollTarget}:CA;$EnrollGUIDStr" 2>&1
-        $R3 = dsacls "$TemplateDN" /G "${NetBIOSDomain}\${EnrollTarget}:CA;$AutoEnrollGUIDStr" 2>&1
+        $R2 = dsacls "$TemplateDN" /G "${NetBIOSDomain}\${EnrollTarget}:CA;Enroll" 2>&1
+        $R3 = dsacls "$TemplateDN" /G "${NetBIOSDomain}\${EnrollTarget}:CA;AutoEnrollment" 2>&1
         if ($LASTEXITCODE -ne 0) {
             Write-Host "    [ERROR] 授予 $EnrollTarget Enroll/Autoenroll 權限失敗" -ForegroundColor Red
             Write-Host "      $R1" -ForegroundColor Red
@@ -998,7 +1031,7 @@ certutil -config $CAConfig -catemplates
 Write-Host @"
 
 ==================================================
-  憑證範本建立完成！（v11，含安全性修正 + Renewal上限修正 + flags/MACHINE_TYPE修正 + 停用繼承Hardening[dsacls] + 驗證誤判修正）
+  憑證範本建立完成！（v13，含安全性修正 + Renewal上限修正 + flags/MACHINE_TYPE修正 + 停用繼承Hardening[dsacls] + Read權限修正 + 驗證誤判修正）
   已建立範本：
     - $($Params.ComputerTemplateName)（1 年，Renewal 273.75 天/6570小時，電腦 Auto-Enrollment，範圍：Domain Computers，flags含MACHINE_TYPE，維持繼承）
     - $($Params.UserTemplateName)（2 年，Renewal 547.5 天/13140小時，使用者 Auto-Enrollment，範圍：Domain Users，flags不含MACHINE_TYPE，已停用繼承）
