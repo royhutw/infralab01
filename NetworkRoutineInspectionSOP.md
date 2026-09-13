@@ -211,10 +211,10 @@ interface GigabitEthernet0/1
 | 6 | 企業SSID正確設定WPA3-Enterprise + 802.1X | 確認RADIUS Server指向NPS雙機（NPS-1/NPS-2），且VLAN欄位設定為「依RADIUS動態指派」，不手動寫死VLAN |
 | 7 | 訪客SSID正確對應VLAN 90 | 手動指定VLAN 90，不可使用預設跟隨AP管理VLAN；開啟Client Isolation（用戶端隔離），避免訪客裝置互相可見 |
 | 8 | 訪客SSID採WPA3-Personal過渡模式 | 使用Transition/Mixed Mode相容WPA2裝置，避免較舊訪客裝置無法連線 |
-| 9 | `Gi0/1` 設定為純Trunk，不套用802.1X/MAB/Port-Security | 確認`switchport mode trunk`、`switchport trunk allowed vlan`（含VLAN34、不含VLAN10）、`ip dhcp snooping trust`、`ip arp inspection trust`、`ip arp inspection limit rate 100`皆已正確設定；確認未殘留任何`dot1x`/`mab`/`authentication`相關指令（Trunk Port不支援，殘留設定僅造成混淆） |
-| 10 | 確認壁掛機櫃門禁管制前提成立 | 確認機櫃鑰匙/門禁為集中管理、領用登記，此為「不套用Port-Security」決策的成立前提，需定期覆核 |
+| 9 | `Gi0/1` 確認Trunk設定正確且不殘留802.1X指令 | 確認`switchport mode trunk`、`switchport trunk allowed vlan`（含VLAN34、不含VLAN10）、`ip dhcp snooping trust`、`ip arp inspection trust`、`ip arp inspection limit rate 100`皆已正確設定；確認未殘留任何`dot1x`/`mab`/`authentication`相關指令（Trunk Port不支援，殘留設定僅造成混淆） |
+| 10 | `Gi0/1` 補上Port-Security綁定AP的實體MAC | `switchport port-security` + `switchport port-security maximum 1`（**不可加`vlan <ID>`限定**，否則僅該VLAN受保護）+ `switchport port-security mac-address <AP實際MAC位址>`（**手動指定，不使用`sticky`**，避免套用順序造成誤學習）+ `switchport port-security violation restrict`（Port保持啟用，僅阻擋多餘裝置流量） |
 | 11 | 端對端測試 | 分別用一台已加入AD網域的公司筆電（企業SSID）與一台未設定的裝置（訪客SSID）實際連線測試，確認VLAN指派、上網範圍符合預期；並在NPS Event Log與交換器端確認認證記錄正常 |
-| 12 | 建立CDP/LLDP鄰居巡檢基準 | 執行`show cdp neighbors detail`與`show lldp neighbors detail`，記錄`Gi0/1`正常情況下應顯示的AP身份資訊，供日後巡檢比對 |
+| 12 | 驗證Port-Security實際生效 | 套用後執行`show port-security interface Gi0/1`，確認`SecureMac Address`欄位顯示的MAC與AP實際MAC相符、`Status`為`Secure-up`；可另外用一台測試裝置實際嘗試插入同Port驗證是否被`restrict`阻擋，並確認AP本身連線不受影響 |
 
 ---
 
@@ -272,17 +272,42 @@ interface GigabitEthernet0/1
    → 若持續重複觸發，勿只靠自動復原，需找出根因並人工介入
 ```
 
-### 情境D：RADIUS雙機皆判定為dead（大量Port落入VLAN 98）
+### 情境E：AD CS的Failed Requests出現大量`CERTSRV_E_TEMPLATE_DENIED`——屬正常噪音，非異常事件
+
+**現象**：在CA伺服器（ADCS）的`certsrv.msc` → `Failed Requests`中，持續看到來自各種電腦帳號（如`CORP\DC01`等非NPS伺服器的Domain Controller、一般工作站、伺服器）針對`EAP-TLS-NPS-Server`範本的申請失敗記錄，`Request Status Code`為`0x80094012 CERTSRV_E_TEMPLATE_DENIED`；或針對`EAP-TLS-User`範本，出現非一般使用者帳號（如服務帳號、未實際互動登入的帳號）的申請失敗、同樣為`CERTSRV_E_TEMPLATE_DENIED`。
+
+**判斷原則：這是預期中的正常現象，不需要處理**，原因如下：
 
 ```
-1. 立即檢查NPS服務狀態（兩台）
-2. 檢查Switch到NPS的三層連通性 (ping 192.168.10.13 / .14)
-3. 檢查UDP 1812/1813是否被中間設備(防火牆規則)誤擋
-4. 確認 radius-server dead-criteria / deadtime 設定是否過於敏感導致誤判
-5. 問題排除後，Port不會自動離開Critical VLAN，需執行：
-   authentication event server alive action reinitialize 已設定，
-   RADIUS恢復後應自動觸發重新認證；若未觸發，可手動 shutdown/no shutdown 該Port
+1. 電腦GPO（PKI - EAP-TLS Computer Auto-Enrollment）連結在網域根層級，
+   涵蓋網域內所有電腦（含DC、一般工作站、伺服器）
+
+2. EAP-TLS-NPS-Server範本的flags含有CT_FLAG_MACHINE_TYPE位元
+   （這是刻意保留的，因為它本來就該是「電腦類型」範本）
+
+3. Windows電腦Autoenrollment引擎的運作邏輯是：
+   只要CA上發布了任何標記為MACHINE_TYPE的範本，
+   就會「嘗試」申請看看，不會預先判斷自己有沒有權限
+
+4. 因此網域內所有電腦都會嘗試申請EAP-TLS-NPS-Server，
+   但只有NPS-Servers群組成員（依dsacls設定的Enroll權限）
+   能真正申請成功，其餘電腦一律被CA正確拒絕
+
+5. 同樣邏輯適用於EAP-TLS-User：所有網域使用者的User GPO
+   （AEPolicy=7）都會嘗試申請EAP-TLS-User，但只有Domain Users
+   成員能申請成功；若某些服務帳號或特殊帳號被排除在Domain Users
+   之外（不常見，但視環境而定），也會出現同樣的拒絕記錄
 ```
+
+**與異常情況的區別（重要，避免誤判）**：
+
+| 情況 | 是否需要處理 | 判斷依據 |
+|---|---|---|
+| 非NPS-Servers成員的電腦申請`EAP-TLS-NPS-Server`被拒 | **不需要**，正常噪音 | Requester Name不在`Get-ADGroupMember NPS-Servers`清單中 |
+| **NPS-Servers群組成員**（如RADIUS1）申請`EAP-TLS-NPS-Server`被拒 | **需要處理**，代表權限設定有誤 | Requester Name應該要能成功，若失敗需比照本SOP「四、CoPP生效驗證」相同精神，重新檢查範本ACL（`Get-Acl "AD:\<範本DN>"`確認Enroll權限是否正確） |
+| 任何帳號原本能拿到憑證、卻突然被拒絕（憑證到期前） | **需要處理** | 可能是群組成員被誤移除、或範本ACL被意外異動，需比對稽核記錄 |
+
+**維運提醒**：此類噪音記錄會隨網域內電腦/使用者數量增加而持續累積，屬於AD CS運作的正常背景雜訊。**每日/每週巡檢時，不需要逐筆檢視`Failed Requests`裡的每一筆記錄**，只需要重點確認「應該成功的對象（RADIUS1、Domain Users成員）是否真的成功」，而非「有沒有失敗記錄」——只要RADIUS1與一般使用者能正常取得對應憑證，`Failed Requests`裡大量其他電腦/帳號的`CERTSRV_E_TEMPLATE_DENIED`記錄可以忽略不看。
 
 ---
 
@@ -403,7 +428,34 @@ authentication event server dead action authorize vlan 98
 
 ---
 
+### 9.5 AD CS憑證範本ACL Hardening：實測驗證過的做法與應避開的陷阱
+
+**背景**：`04_create_templates.ps1`建立的三個EAP-TLS憑證範本，經過多輪實測排查，才找到能真正生效的權限收斂做法。以下記錄完整經驗，避免日後重建範本或調整其他AD CS範本時，重蹈已驗證過的陷阱。
+
+**最終採用做法**：改用`dsacls.exe`（Windows內建、獨立於.NET物件模型的命令列工具）管理範本ACL，而非PowerShell的`[ADSI]`/`Get-Acl`/`Set-Acl`/`DirectoryEntry`等.NET介面。
+
+**已驗證會失敗、不建議再嘗試的做法**：
+
+| 做法 | 失敗現象 |
+|---|---|
+| `[ADSI]` + `CommitChanges()` | 整段寫入靜默失敗，無錯誤訊息但實際完全沒生效 |
+| `Get-Acl`/`Set-Acl`（AD:磁碟機） | 能正確寫入個別ACE（新增/移除權限對象），但`SetAccessRuleProtection`（停用繼承）這個控制位元的異動未被寫回AD |
+| `DirectoryEntry` + `Options.SecurityMasks` | 在Windows PowerShell 5.1 Desktop環境直接拋出「SecurityMasks屬性不存在」的例外 |
+
+**`dsacls`正確用法的兩個關鍵眉角**：
+
+1. **執行順序**：必須先執行`/P:Y`（停用繼承）,讓原本繼承而來的規則轉為此物件自身的顯式副本，之後`/R`才移除得掉；順序顛倒（先`/R`再`/P:Y`）會導致`/R`找不到可移除的對象（此時規則仍是繼承而來，非物件自身的顯式ACE）。
+2. **Extended Right的指定方式**：`/G "principal:CA;<name>"`裡的`<name>`必須是**已註冊的顯示名稱**（如`Enroll`、`AutoEnrollment`），**不接受直接傳入原始GUID字串**（會報`No GUID Found`錯誤）。
+
+**最容易被忽略、卻是關鍵的一點：停用繼承後務必保留`Authenticated Users`的Read權限**——只收斂Enroll範圍（如僅授權`Domain Users`或`NPS-Servers`），完全移除`Authenticated Users`的Read權限後，會導致**CA伺服器自己都無法讀取範本物件**（CA伺服器的電腦帳號通常不在`Domain Admins`/`Enterprise Admins`，也不在自訂的Enroll對象清單中），造成`certutil -SetCATemplates`回報`Element not found`、範本無法正確發布或維持發布狀態。正確做法是：**Read權限維持廣泛開放（`Authenticated Users`），只收斂Enroll/Autoenroll這個動作**，因為Read不等於Enroll，不影響「誰能實際申請到憑證」這個安全目標。
+
+**驗證ACL異動是否真的生效的可靠方式**：`Get-Acl "AD:\<範本DN>"`讀取是可靠的（整個排查過程中從未出現誤判），但**寫入後不要在同一個PowerShell工作階段內立即重新讀取驗證**，建議開啟全新的PowerShell視窗查證，避免同一工作階段的潛在快取影響判斷。
+
+**電腦Autoenrollment的預期噪音**：完成Hardening後，网域內所有電腦（含DC）仍會嘗試申請`EAP-TLS-NPS-Server`（因其`flags`含`CT_FLAG_MACHINE_TYPE`，電腦Autoenrollment引擎見到即嘗試），但只有`NPS-Servers`群組成員能申請成功，其餘一律在CA的`Failed Requests`留下`CERTSRV_E_TEMPLATE_DENIED`記錄——詳見「七、事件排錯流程」情境E，此為正常現象。
+
+---
+
 - 本SOP基於IOU Lab環境設計，部分指令（如CoPP硬體驗證、NBAR protocol比對）在正式Catalyst設備上行為可能與Lab不同，正式上線前建議重新驗證一次。
 - 建議將「每日巡檢」項目未來納入自動化腳本（如Python + Netmiko/Paramiko定期抓取並比對），減少人工執行負擔並能更早發現異常趨勢。
 - NPS本身不支援RADIUS CoA，因此「情境D」中RADIUS恢復後的Port重新認證，依賴的是Switch端`authentication event server alive action reinitialize`機制，而非NPS主動推播，這點在教育維運人員時需特別說明清楚。
-- Server Port（VM Host）目前採整段trust設計，已知的備選強化方向（ARP ACL）記錄於「八、已知的備選強化方向」，建議每次每月健檢覆盤虛擬化層防護狀態時一併參考，評估是否需要導入。
+- Server Port（VM Host）目前採整段trust設計，已知的備選強化方向（ARP ACL）記錄於「九、已知的備選強化方向」9.1節，建議每次每月健檢覆盤虛擬化層防護狀態時一併參考，評估是否需要導入。
