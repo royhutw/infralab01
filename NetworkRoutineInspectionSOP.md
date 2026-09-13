@@ -455,6 +455,37 @@ authentication event server dead action authorize vlan 98
 
 ---
 
+### 9.6 已發布內建範本ACL稽核結果（2026年執行，建議每次CA重大變更後複查）
+
+**背景**：`certtmpl.msc`顯示AD森林內所有範本物件（不論是否被任何CA發布），`certsrv.msc`的`Certificate Templates`節點則只顯示**這台CA自己選擇發布**的範本（存於CA本機登錄檔，非AD層級設定）。只有「已發布」的範本才具備實際可被利用的風險，因此稽核應以`certutil -CATemplates`的實際輸出為準，而非`certtmpl.msc`看到的全部範本。
+
+**稽核範圍**：本CA目前已發布的範本，除自建的`EAP-TLS-Computer`/`EAP-TLS-User`/`EAP-TLS-NPS-Server`（已於9.1～9.5節處理）外，尚有以下11個Windows Enterprise CA角色安裝時的標準預設範本：
+
+| 範本 | Enroll對象 | 稽核結論 |
+|---|---|---|
+| WebServer | 僅`Domain Admins`/`Enterprise Admins` | 🟢 安全，一般帳號無法申請 |
+| Administrator | 僅`Domain Admins`/`Enterprise Admins` | 🟢 安全 |
+| EFSRecovery | 僅`Domain Admins`/`Enterprise Admins` | 🟢 安全 |
+| EFS | `Domain Users`可Enroll | 🟢 安全（設計如此）——EKU僅`Encrypting File System`，不含`Client Authentication`，即使使用者可自訂Subject也無法用於身份驗證冒充 |
+| User | `Domain Users`可Enroll | 🟢 安全（已逐位元驗證）——`msPKI-Certificate-Name-Flag = 0xA6000000`，未包含`CT_FLAG_ENROLLEE_SUPPLIES_SUBJECT`（0x1），Subject/SAN一律由CA依申請者本人AD屬性（DN、Email、UPN）建構，不可自訂 |
+| DomainController | 僅DC層級身份（Domain Controllers/Enterprise Domain Controllers/Enterprise Read-only DCs/Domain Admins/Enterprise Admins） | 🟢 安全 |
+| DomainControllerAuthentication | 同上，DC層級身份 | 🟢 安全 |
+| KerberosAuthentication | 同上，DC層級身份 | 🟢 安全 |
+| DirectoryEmailReplication | 同上，DC層級身份 | 🟢 安全 |
+| SubCA | 僅`Domain Admins`/`Enterprise Admins` | 🟢 安全（此範本歷史上敏感度高，鎖定良好） |
+| Machine | `Domain Computers`可Enroll | 🟢 安全（標準設計，Subject由CA依電腦物件dNSHostName建構，不可自訂，與自建的EAP-TLS-Computer同邏輯） |
+
+**稽核結論**：本次稽核的11個內建預設範本，Enroll權限授予範圍均合理（管理群組、DC層級身份，或有正當理由的Domain Users/Domain Computers），**未發現ESC1類型的提權風險組合**（廣泛低權限Enroll + 可自訂Subject/SAN + Client Authentication類EKU同時成立），**不需要額外的ACL Hardening**。
+
+**判斷方法論（供未來稽核其他範本參考）**：
+1. 先用`certutil -CATemplates`確認CA實際發布哪些範本（只稽核這份清單，未發布的範本無實際風險）
+2. 用`Get-Acl "AD:\<範本DN>"`確認Enroll對象範圍是否合理（管理群組/DC層級身份=正常；Domain Users/Authenticated Users廣泛開放=需要進一步檢查）
+3. 若Enroll對象範圍廣泛，需檢查兩件事才能判定是否為ESC1風險：(a) 該範本EKU是否包含`Client Authentication`(1.3.6.1.5.5.7.3.2)或`Smart Card Logon`等可用於身份驗證的用途；(b) `msPKI-Certificate-Name-Flag`是否包含`CT_FLAG_ENROLLEE_SUPPLIES_SUBJECT`(最低位元0x1)。**兩者同時成立才構成風險**，任一者不成立則安全（如EFS雖可自訂但EKU不支援身份驗證；User雖EKU支援但不可自訂Subject）
+
+**維運提醒**：未來若考慮發布任何新範本（含AD內已存在但目前未發布的其他內建範本，或自訂範本），發布前務必先執行上述三步驟判斷方法論，不可未經檢查直接發布——這正是本專案`EAP-TLS-User`範本初版所犯的錯誤（詳見9.5節）。
+
+---
+
 - 本SOP基於IOU Lab環境設計，部分指令（如CoPP硬體驗證、NBAR protocol比對）在正式Catalyst設備上行為可能與Lab不同，正式上線前建議重新驗證一次。
 - 建議將「每日巡檢」項目未來納入自動化腳本（如Python + Netmiko/Paramiko定期抓取並比對），減少人工執行負擔並能更早發現異常趨勢。
 - NPS本身不支援RADIUS CoA，因此「情境D」中RADIUS恢復後的Port重新認證，依賴的是Switch端`authentication event server alive action reinitialize`機制，而非NPS主動推播，這點在教育維運人員時需特別說明清楚。
