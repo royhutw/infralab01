@@ -6,19 +6,12 @@
 
 一、檔案清單
 ────────────────────────────────────────────────────────────────
-  ca-env.bat              共用參數設定檔（唯一參數來源，必須放在跟
-                          其他 .bat 相同的目錄，各腳本會自動載入）
   openssl-rootca.cnf      Root CA 設定檔（必須先複製到 C:\RootCA\）
   01_init_rootca.bat      初始化 Root CA（只執行一次）
   02_sign_intermediate.bat 簽發 Intermediate CA 憑證（數年一次）
   03_renew_crl.bat        更新 CRL（每年執行一次）
-  04_revoke_cert.bat      撤銷憑證（需要時執行，帶命令列參數執行，
-                          不需要編輯本檔案，見「六、憑證撤銷流程」）
+  04_revoke_cert.bat      撤銷憑證（需要時執行）
   05_verify_inspect.bat   狀態檢查工具（每次上線時執行）
-
-  【重要】所有環境路徑 / 有效期天數 / DN 辨別名稱 / CRL 發布 URL
-  一律只在 ca-env.bat 修改，不要在個別 .bat 或 .cnf 裡另外修改，
-  以免出現兩份不一致的設定值。
 
 
 二、前置作業
@@ -30,9 +23,7 @@
   2. 確認 OpenSSL 版本（建議 1.1.1 以上）
      C:\OpenSSL-Win64\bin\openssl.exe version
 
-  3. 將所有腳本、ca-env.bat 與設定檔複製到 C:\RootCA\
-     （若日後要改用其他路徑，只需要改 ca-env.bat 裡的 CA_DIR 一處，
-       .cnf 與其餘 .bat 都會自動吃到新值）
+  3. 將所有腳本與設定檔複製到 C:\RootCA\
 
   4. 此 VM 從此保持離線（拔除網路線或停用網卡）
 
@@ -100,11 +91,8 @@
     由 Intermediate CA 負責撤銷）
 
   Step 1：將欲撤銷的 .crt 憑證複製到 C:\RootCA\certs\
-  Step 2：執行 04_revoke_cert.bat，用命令列參數帶入憑證路徑與撤銷原因
-            例：04_revoke_cert.bat "C:\RootCA\certs\intermediateCA.crt" keyCompromise
-          若不帶參數直接執行，腳本會列出 certs\ 底下現有憑證並
-          以互動選單詢問撤銷原因，皆不需要編輯腳本原始碼。
-  Step 3：確認撤銷資訊後輸入 YES，再輸入 Root CA 私鑰密碼
+  Step 2：修改 04_revoke_cert.bat 中的 REVOKE_CRT 路徑
+  Step 3：執行 04_revoke_cert.bat，輸入撤銷原因
   Step 4：立即執行 03_renew_crl.bat 重新產生 CRL
   Step 5：發布新的 CRL
 
@@ -121,11 +109,10 @@
 
 八、CRL Distribution Point（CDP）設定說明
 ────────────────────────────────────────────────────────────────
-  CRL 發布 URL 由 ca-env.bat 的 CA_CRL_URL 變數統一管理，
-  openssl-rootca.cnf 會透過 $ENV::CA_CRL_URL 自動讀取，
-  不需要再手動編輯 .cnf 檔案。若要更換 URL，只需修改：
+  在 openssl-rootca.cnf 的 [v3_intermediate_ca] 區塊中，
+  取消以下行的註解並填入您的 CRL 發布 URL：
 
-    ca-env.bat 內的：set CA_CRL_URL=http://pki.yourdomain.com/crl/rootCA.crl
+    crlDistributionPoints = URI:http://pki.yourdomain.com/crl/rootCA.crl
 
   此 URL 必須是 HTTP（不是 HTTPS），且外部用戶端必須可存取。
   建議將 CRL 放在一台簡單的 IIS 或 nginx 上提供靜態檔案下載。

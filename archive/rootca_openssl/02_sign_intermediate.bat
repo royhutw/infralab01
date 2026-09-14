@@ -1,19 +1,28 @@
-﻿@echo off
+@echo off
 :: ============================================================
 ::  02_sign_intermediate.bat
 ::  使用 Root CA 簽發 Intermediate CA 憑證
 ::  執行時機：建立新的 Intermediate CA 時（數年一次）
 ::  流程：接收 Intermediate CA 的 CSR → 簽發 → 輸出憑證
-::
-::  參數來源：ca-env.bat
 :: ============================================================
 
 setlocal
-call "%~dp0ca-env.bat"
 
-:: ── 本次操作專屬的輸入/輸出路徑（非環境參數，故留在此檔案）───
+:: ── 參數區（請依實際環境修改） ──────────────────────────────
+set CA_DIR=C:\RootCA
+set OPENSSL=C:\OpenSSL-Win64\bin\openssl.exe
+set CONFIG=%CA_DIR%\openssl-rootca.cnf
+
+:: Intermediate CA CSR 檔案路徑（從 Intermediate CA 機器複製過來）
 set INT_CSR=%CA_DIR%\requests\intermediateCA.csr
+
+:: 簽發的 Intermediate CA 憑證輸出路徑
 set INT_CRT=%CA_DIR%\certs\intermediateCA.crt
+
+:: Intermediate CA 憑證有效期（10年 = 3650天）
+set INT_DAYS=3650
+
+:: ────────────────────────────────────────────────────────────
 
 echo.
 echo [INFO] ================================================

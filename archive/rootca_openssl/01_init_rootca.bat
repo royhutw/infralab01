@@ -1,16 +1,34 @@
-﻿@echo off
+@echo off
 :: ============================================================
 ::  01_init_rootca.bat
 ::  Root CA 初始化腳本（只需執行一次）
 ::  建立目錄結構、產生私鑰、自簽 Root CA 憑證
 ::  適用：Windows 7 x64 + OpenSSL
-::
-::  參數來源：ca-env.bat（請勿在此檔案內修改參數，
-::           所有環境路徑 / 天數 / DN 一律去 ca-env.bat 修改）
 :: ============================================================
 
 setlocal
-call "%~dp0ca-env.bat"
+
+:: ── 參數區（請依實際環境修改） ──────────────────────────────
+set CA_DIR=C:\RootCA
+set OPENSSL=C:\OpenSSL-Win64\bin\openssl.exe
+set CONFIG=%CA_DIR%\openssl-rootca.cnf
+
+:: Root CA 私鑰長度（建議 4096）
+set KEY_BITS=4096
+
+:: Root CA 憑證有效期（25年 = 9131天，含6個閏年）
+set CA_DAYS=9131
+
+:: Root CA 辨別名稱（DN）必填欄位
+set CA_COUNTRY=TW
+set CA_ORG=MyOrg Ltd
+set CA_CN=MyOrg Root CA
+:: 選填欄位（可留空）
+set CA_STATE=
+set CA_LOCALITY=
+set CA_OU=
+
+:: ────────────────────────────────────────────────────────────
 
 echo.
 echo [INFO] ================================================
@@ -44,8 +62,8 @@ echo        ├── db\           （資料庫與序號）
 echo        └── requests\     （CSR 暫存）
 echo.
 
-:: ── Step 3：確認設定檔存在 ────────────────────────────────────
-echo [3/6] 確認設定檔...
+:: ── Step 3：複製設定檔 ────────────────────────────────────────
+echo [3/6] 複製設定檔...
 if not exist "%CONFIG%" (
     echo [ERROR] 找不到設定檔：%CONFIG%
     echo [ERROR] 請先將 openssl-rootca.cnf 複製到 %CA_DIR%\
@@ -88,12 +106,12 @@ if errorlevel 1 (
     exit /b 1
 )
 
-:: ── Step 6：產生第一份 CRL（空白，有效期 CRL_DAYS 天）───────
+:: ── Step 6：產生第一份 CRL（空白，有效期 1 年）───────────────
 echo.
-echo [6/6] 產生初始 CRL（有效期 %CRL_DAYS% 天）...
+echo [6/6] 產生初始 CRL（有效期 365 天）...
 "%OPENSSL%" ca -config "%CONFIG%" ^
     -gencrl ^
-    -crldays %CRL_DAYS% ^
+    -crldays 365 ^
     -out "%CA_DIR%\crl\rootCA.pem"
 
 if errorlevel 1 (

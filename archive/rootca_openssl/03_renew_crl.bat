@@ -1,18 +1,25 @@
-﻿@echo off
+@echo off
 :: ============================================================
 ::  03_renew_crl.bat
 ::  Root CA 年度 CRL 更新腳本
 ::  執行時機：每年 Root CA 需要上線時執行
 ::  執行完畢後請立即將更新的 CRL 複製到發布伺服器，然後關機
-::
-::  參數來源：ca-env.bat
 :: ============================================================
 
 setlocal
-call "%~dp0ca-env.bat"
+
+:: ── 參數區（請依實際環境修改） ──────────────────────────────
+set CA_DIR=C:\RootCA
+set OPENSSL=C:\OpenSSL-Win64\bin\openssl.exe
+set CONFIG=%CA_DIR%\openssl-rootca.cnf
+
+:: CRL 有效期（天）- 設 400 天，預留 35 天緩衝
+set CRL_DAYS=400
 
 :: CRL 發布目的地（若有網路可直接複製，否則手動複製）
 :: set CRL_PUBLISH=\\fileserver\pki\rootCA.crl
+
+:: ────────────────────────────────────────────────────────────
 
 :: ── 取得目前時間（用於備份檔名）──────────────────────────────
 for /f "tokens=1-3 delims=/ " %%a in ('date /t') do (
@@ -111,7 +118,7 @@ echo        備份檔案：%CA_DIR%\crl\rootCA_%TIMESTAMP%.crl
 echo.
 echo [INFO] CRL 發布後，請確認：
 echo        1. 將 rootCA.crl 複製到 Web / 檔案伺服器
-echo        2. URL 路徑須與憑證內 CDP 欄位一致（見 ca-env.bat 的 CA_CRL_URL）
+echo        2. URL 路徑須與憑證內 CDP 欄位一致
 echo        3. 下次需在有效期到期前執行此腳本更新
 echo.
 echo [WARN] ================================================

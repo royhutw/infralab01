@@ -2,12 +2,7 @@
 #  OpenSSL Root CA 設定檔
 #  適用：Windows 7 x64 + OpenSSL（離線 Root CA）
 #  CA 有效期：25 年
-#  CRL 有效期：400 天（每年上線更新一次）
-#
-#  【重要】本檔案的路徑 / DN 欄位 / CRL URL 一律透過
-#  $ENV::變數名稱 讀取 ca-env.bat 設定的環境變數，
-#  執行任何 openssl 指令前，請先 call ca-env.bat（各 .bat 腳本已內建）。
-#  不要在這裡直接寫死路徑或機構資訊，避免與 ca-env.bat 產生兩份來源。
+#  CRL 有效期：1 年（每年上線更新一次）
 # ============================================================
 
 [ ca ]
@@ -15,7 +10,7 @@ default_ca = CA_default
 
 # ── CA 核心設定 ───────────────────────────────────────────────
 [ CA_default ]
-dir               = $ENV::CA_DIR                 # ← 來自 ca-env.bat
+dir               = C:/RootCA                    # ← CA 工作根目錄
 certs             = $dir/certs                   # 已簽發憑證存放
 crl_dir           = $dir/crl                     # CRL 存放目錄
 database          = $dir/db/index.txt            # 憑證資料庫
@@ -31,11 +26,8 @@ RANDFILE          = $dir/private/.rand
 default_md        = sha256
 
 # ── 憑證與 CRL 預設有效期 ─────────────────────────────────────
-# 註：實際簽發天數以各腳本呼叫 openssl 時的 -days / -crldays 為準
-# （來自 ca-env.bat 的 CA_DAYS / INT_DAYS / CRL_DAYS），
-# 這裡的值僅作為未指定 -days 時的備援。
-default_days      = 1825
-default_crl_days  = 365
+default_days      = 1825                         # 子憑證預設 5 年
+default_crl_days  = 365                          # CRL 有效期 1 年
 
 # ── 原則：Root CA 只簽 Intermediate CA，欄位須完全吻合 ────────
 policy            = policy_strict
@@ -46,7 +38,7 @@ unique_subject    = yes
 [ policy_strict ]
 countryName             = match                  # 必須與 Root CA 相同
 stateOrProvinceName     = optional
-organizationName        = supplied               # 必須與 Root CA 相同
+organizationName        = supplied                  # 必須與 Root CA 相同
 organizationalUnitName  = optional
 commonName              = supplied               # 必填
 emailAddress            = optional
@@ -70,30 +62,26 @@ string_mask         = utf8only
 default_md          = sha256
 x509_extensions     = v3_root_ca                 # 自簽時套用 Root CA 擴充
 
-# 【說明】01_init_rootca.bat 目前用 -subj 直接指定 DN，
-# 會略過下面這組 *_default 提示值。保留 $ENV:: 寫法是為了：
-#   1) 若未來改用互動式輸入（拿掉 -subj），這裡會自動吃到正確預設值
-#   2) 避免有人誤以為改這裡就能改到憑證內容，卻改錯地方
 [ req_distinguished_name ]
 countryName                     = Country Name (2 letter code)
-countryName_default             = $ENV::CA_COUNTRY
+countryName_default             = TW
 countryName_min                 = 2
 countryName_max                 = 2
 
 stateOrProvinceName             = State or Province Name
-stateOrProvinceName_default     = $ENV::CA_STATE
+stateOrProvinceName_default     = Taiwan
 
 localityName                    = Locality Name
-localityName_default            = $ENV::CA_LOCALITY
+localityName_default            = Taipei
 
 organizationName                = Organization Name
-organizationName_default        = $ENV::CA_ORG
+organizationName_default        = MyOrg Ltd
 
 organizationalUnitName          = Organizational Unit Name
-organizationalUnitName_default  = $ENV::CA_OU
+organizationalUnitName_default  = IT Department
 
 commonName                      = Common Name
-commonName_default              = $ENV::CA_CN
+commonName_default              = MyOrg Root CA
 commonName_max                  = 64
 
 # ── Root CA 憑證擴充欄位 ──────────────────────────────────────
@@ -111,9 +99,8 @@ subjectKeyIdentifier    = hash
 authorityKeyIdentifier  = keyid:always, issuer
 basicConstraints        = critical, CA:true, pathlen:0       # 不可再簽下層 CA
 keyUsage                = critical, keyCertSign, cRLSign
-# CRL Distribution Point：來自 ca-env.bat 的 CA_CRL_URL，
-# 不需要再手動編輯本檔案（取代原 readme 第八節的手動修改步驟）
-crlDistributionPoints = URI:$ENV::CA_CRL_URL
+# CRL Distribution Point：填入 Root CA 發布 CRL 的 URL
+crlDistributionPoints = URI:http://crl.corp.foo.bar.tw/rootca.crl
 
 # ── CRL 擴充欄位 ──────────────────────────────────────────────
 [ crl_ext ]
