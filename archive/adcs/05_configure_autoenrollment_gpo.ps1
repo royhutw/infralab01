@@ -29,18 +29,21 @@
 #       04 腳本，再執行本腳本。
 # ============================================================
 
-#region ── 參數區（統一從 CAConfig.psd1 讀取，請至該檔案修改參數）──
-# 本腳本用到的區塊：Global（網域名稱/DN）、AutoEnrollGPO（GPO名稱）
-. (Join-Path $PSScriptRoot 'Import-CAConfig.ps1')
-$Params = Merge-CAConfig -Sections 'Global','AutoEnrollGPO'
+#region ── 參數區 ────────────────────────────────────────────
+$Params = @{
+    DomainName      = 'corp.foo.bar.tw'
+    DomainDN        = 'DC=corp,DC=foo,DC=bar,DC=tw'
 
-# ── 連結目標（網域根層級，涵蓋所有子OU下的電腦/使用者）──────
-#  注意：此為「連結目標」而非「套用群組」，實際能否成功取得
-#  憑證，仍取決於各憑證範本的 ACL 授權對象（見 04 腳本）。
-#  直接沿用 CAConfig.psd1 Global 區塊的 DomainDN，不再另外
-#  重複定義一份一模一樣的 DN 字串。
-$Params.ComputerGPOTarget = $Params.DomainDN
-$Params.UserGPOTarget     = $Params.DomainDN
+    # ── GPO 名稱 ─────────────────────────────────────────────
+    ComputerGPOName = 'PKI - EAP-TLS Computer Auto-Enrollment'
+    UserGPOName     = 'PKI - EAP-TLS User Auto-Enrollment'
+
+    # ── 連結目標（網域根層級，涵蓋所有子OU下的電腦/使用者）──
+    #  注意：此為「連結目標」而非「套用群組」，實際能否成功取得
+    #  憑證，仍取決於各憑證範本的 ACL 授權對象（見 04 腳本）。
+    ComputerGPOTarget = 'DC=corp,DC=foo,DC=bar,DC=tw'
+    UserGPOTarget     = 'DC=corp,DC=foo,DC=bar,DC=tw'
+}
 #endregion
 
 Install-WindowsFeature GPMC -ErrorAction Stop | Out-Null

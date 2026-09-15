@@ -28,31 +28,59 @@
 #        $cert.Thumbprint
 # ============================================================
 
-#region ── 參數區（統一從 CAConfig.psd1 讀取，請至該檔案修改參數）──
-# 本腳本用到的區塊：Global（網域/CA名稱/CRL發布路徑）、
-# RootCADN（CSR DN欄位，需與Root CA一致）、ADCSInstall（金鑰設定）、
-# CRLPolicy（僅供對照，實際CRL週期由03腳本套用）、
-# DSCCredential（DSC Credential 加密憑證）、
-# ExchangePaths（CSR/憑證交換路徑）
-. (Join-Path $PSScriptRoot 'Import-CAConfig.ps1')
-$Params = Merge-CAConfig -Sections 'Global','RootCADN','ADCSInstall','CRLPolicy','DSCCredential','ExchangePaths'
+#region ── 參數區（請依實際環境修改） ────────────────────────
+$ADCSParams = @{
+    # ── CA 基本設定 ─────────────────────────────────────────
+    CACommonName        = 'corp-foo-bar-tw-SubCA'      # CA 顯示名稱（建議含組織辨識）
+    DomainName          = 'corp.foo.bar.tw'            # 網域 FQDN
 
-# CSR DN 欄位（必須與 Root CA 的 openssl-rootca.cnf 一致）：
-# Root CA 的 policy_strict 要求 countryName 與 organizationName
-# 必須存在且與 Root CA 憑證完全相符，否則 OpenSSL 會拒絕簽署 CSR。
-#
-# CADistinguishedNameSuffix 會組合成 CSR 的完整 DN，格式為：
-#   CN=<CACommonName> + CADistinguishedNameSuffix
-# 例：CN=corp-foo-bar-tw-SubCA, O=MyOrg Ltd, C=TW, DC=corp, DC=foo, DC=bar, DC=tw
-#
-# ⚠️  C= 與 O= 的值必須與 Root CA 憑證中的值完全一致（大小寫亦須相符），
-#     這組值定義在 CAConfig.psd1 的 RootCADN 區塊。
-#
-# CADistinguishedNameSuffix 由上方欄位組合而成（於腳本後段自動組合，勿手動修改此行）
+    # ── CSR DN 欄位（必須與 Root CA 的 openssl-rootca.cnf 一致）────
+    # Root CA 的 policy_strict 要求 countryName 與 organizationName
+    # 必須存在且與 Root CA 憑證完全相符，否則 OpenSSL 會拒絕簽署 CSR。
+    #
+    # CADistinguishedNameSuffix 會組合成 CSR 的完整 DN，格式為：
+    #   CN=<CACommonName> + CADistinguishedNameSuffix
+    # 例：CN=corp-foo-bar-tw-SubCA, O=MyOrg Ltd, C=TW, DC=corp, DC=foo, DC=bar, DC=tw
+    #
+    # ⚠️  C= 與 O= 的值必須與 Root CA 憑證中的值完全一致（大小寫亦須相符）
+    CACountry           = 'TW'                         # ← 需與 Root CA 的 CA_COUNTRY 相符
+    CAOrganization      = 'MyOrg Ltd'                  # ← 需與 Root CA 的 CA_ORG 相符
+    #CAState             = ''                     # ← 需與 Root CA 的 CA_STATE 相符（選填）
+    #CALocality          = ''                     # ← 需與 Root CA 的 CA_LOCALITY 相符（選填）
+    #CAOU                = ''              # 組織單位（選填）
 
-# Subordinate CA 有效期（需小於 Root CA 剩餘效期）：
-# 此值最終取決於 Root CA 簽發時指定的天數，DSC 僅安裝角色，
-# 實際有效期在提交 CSR 給 Root CA 時由 Root CA 決定
+    # CADistinguishedNameSuffix 由上方欄位組合而成（於腳本後段自動組合，勿手動修改此行）
+
+    # ── 金鑰設定 ────────────────────────────────────────────
+    KeyLength           = 4096                         # RSA 金鑰長度
+    HashAlgorithm       = 'SHA256'                     # 雜湊演算法
+
+    # ── Subordinate CA 有效期（需小於 Root CA 剩餘效期） ───
+    # 此值最終取決於 Root CA 簽發時指定的天數，DSC 僅安裝角色
+    # 實際有效期在提交 CSR 給 Root CA 時由 Root CA 決定
+
+    # ── CRL 與 CDP 設定 ──────────────────────────────────────
+    # CRL 發布至此 Web 伺服器路徑（需另建 IIS 提供靜態下載）
+    CRLPublishPath      = 'C:\CRLPublish'              # 本機 CRL 輸出目錄
+    CDPUrl              = 'http://crl.corp.foo.bar.tw/CRL'  # 對外 CRL HTTP URL
+    AIAUrl              = 'http://crl.corp.foo.bar.tw/AIA'  # 對外 AIA HTTP URL
+
+    # ── CRL 更新週期 ─────────────────────────────────────────
+    CRLPeriodUnits      = 1                            # CRL 有效期數值
+    CRLPeriod           = 'Weeks'                      # CRL 有效期單位（Days/Weeks/Months）
+    CRLDeltaPeriodUnits = 1                            # Delta CRL 有效期數值
+    CRLDeltaPeriod      = 'Days'                       # Delta CRL 有效期單位
+
+    # ── DSC Credential 加密憑證 ──────────────────────────────
+    CertificateThumbprint = 'YOUR_CERTIFICATE_THUMBPRINT_HERE'  # ← 請修改
+    CertificatePath       = 'C:\DSC\DSC_Credential_Encryption.cer'
+
+    # ── CSR 暫存路徑（提交給離線 Root CA 用） ───────────────
+    CSROutputPath       = 'C:\CAConfig\SubCA.req'      # CSR 輸出路徑
+    SignedCertPath      = 'C:\CAConfig\SubCA.crt'      # Root CA 簽回的憑證路徑
+    RootCACertPath      = 'C:\CAConfig\RootCA.crt'     # Root CA 憑證路徑（需事先複製）
+    RootCACRLPath       = 'C:\CAConfig\RootCA.crl'     # Root CA CRL（需事先複製）
+}
 #endregion
 
 #region ── LCM 設定 ──────────────────────────────────────────
@@ -64,7 +92,7 @@ Configuration LCM_ADCSConfig {
             ActionAfterReboot              = 'ContinueConfiguration'
             ConfigurationMode              = 'ApplyAndAutoCorrect'
             ConfigurationModeFrequencyMins = 15
-            CertificateID                  = $Params.CertificateThumbprint
+            CertificateID                  = $ADCSParams.CertificateThumbprint
         }
     }
 }
@@ -132,12 +160,12 @@ Configuration Install_EnterpriseSubCA {
             Ensure                    = 'Present'
             IsSingleInstance          = 'Yes'    # 此資源在每個節點只能有一個實例，為必填固定值
             CAType                    = 'EnterpriseSubordinateCA'
-            CACommonName              = $Params.CACommonName
-            CADistinguishedNameSuffix = $Params.CADistinguishedNameSuffix  # 由腳本自動組合
-            KeyLength                 = $Params.KeyLength
-            HashAlgorithmName         = $Params.HashAlgorithm
+            CACommonName              = $ADCSParams.CACommonName
+            CADistinguishedNameSuffix = $ADCSParams.CADistinguishedNameSuffix  # 由腳本自動組合
+            KeyLength                 = $ADCSParams.KeyLength
+            HashAlgorithmName         = $ADCSParams.HashAlgorithm
             CryptoProviderName        = 'RSA#Microsoft Software Key Storage Provider'
-            OutputCertRequestFile     = $Params.CSROutputPath  # CSR 輸出，供提交 Root CA
+            OutputCertRequestFile     = $ADCSParams.CSROutputPath  # CSR 輸出，供提交 Root CA
             OverwriteExistingCAinDS   = $false
             OverwriteExistingDatabase = $false
             OverwriteExistingKey      = $false
@@ -164,7 +192,7 @@ Configuration Install_EnterpriseSubCA {
 Write-Host ""
 Write-Host "=================================================="  -ForegroundColor Cyan
 Write-Host "  AD CS Enterprise Subordinate CA 安裝"             -ForegroundColor Cyan
-Write-Host "  網域：$($Params.DomainName)"                  -ForegroundColor Cyan
+Write-Host "  網域：$($ADCSParams.DomainName)"                  -ForegroundColor Cyan
 Write-Host "=================================================="  -ForegroundColor Cyan
 Write-Host ""
 Write-Host "[密碼輸入] Domain Admin Credential" -ForegroundColor Yellow
@@ -172,7 +200,7 @@ Write-Host "  需要 Domain Admins 與 Enterprise Admins 群組成員資格" -Fo
 Write-Host ""
 
 $DomainAdminCred = Get-Credential `
-    -UserName "$($Params.DomainName)\Administrator" `
+    -UserName "$($ADCSParams.DomainName)\Administrator" `
     -Message  '請輸入 Domain Administrator 帳號密碼（需具備 Enterprise Admins 權限）'
 
 if ($null -eq $DomainAdminCred) {
@@ -186,9 +214,9 @@ Write-Host ""
 Write-Host "[前置確認] 檢查必要檔案..." -ForegroundColor Yellow
 
 $PreChecks = @(
-    @{ Path = $Params.RootCACertPath; Label = 'Root CA 憑證 (.crt)' },
-    @{ Path = $Params.RootCACRLPath;  Label = 'Root CA CRL (.crl)'  },
-    @{ Path = $Params.CertificatePath; Label = 'DSC 加密憑證 (.cer)' }
+    @{ Path = $ADCSParams.RootCACertPath; Label = 'Root CA 憑證 (.crt)' },
+    @{ Path = $ADCSParams.RootCACRLPath;  Label = 'Root CA CRL (.crl)'  },
+    @{ Path = $ADCSParams.CertificatePath; Label = 'DSC 加密憑證 (.cer)' }
 )
 
 $PreCheckFailed = $false
@@ -211,19 +239,19 @@ if ($PreCheckFailed) {
 # 將 Root CA 憑證發布至 AD 與本機信任存放區
 Write-Host ""
 Write-Host "[前置] 匯入 Root CA 憑證至本機信任存放區..." -ForegroundColor Yellow
-certutil -addstore "Root" $Params.RootCACertPath | Out-Null
-certutil -addstore "Root" $Params.RootCACRLPath  | Out-Null
+certutil -addstore "Root" $ADCSParams.RootCACertPath | Out-Null
+certutil -addstore "Root" $ADCSParams.RootCACRLPath  | Out-Null
 Write-Host "  [OK] Root CA 憑證已匯入。" -ForegroundColor Green
 
 # 將 Root CA 憑證發布至 AD NTAuthCertificates（Enterprise CA 必要）
 Write-Host "[前置] 發布 Root CA 憑證至 AD（NTAuthCertificates）..." -ForegroundColor Yellow
-certutil -dspublish -f $Params.RootCACertPath RootCA | Out-Null
+certutil -dspublish -f $ADCSParams.RootCACertPath RootCA | Out-Null
 Write-Host "  [OK] 發布完成。" -ForegroundColor Green
 #endregion
 
 #region ── 建立必要目錄 ──────────────────────────────────────
-New-Item -Path $Params.CRLPublishPath -ItemType Directory -Force | Out-Null
-New-Item -Path (Split-Path $Params.CSROutputPath) -ItemType Directory -Force | Out-Null
+New-Item -Path $ADCSParams.CRLPublishPath -ItemType Directory -Force | Out-Null
+New-Item -Path (Split-Path $ADCSParams.CSROutputPath) -ItemType Directory -Force | Out-Null
 #endregion
 
 #region ── 自動組合 CADistinguishedNameSuffix ────────────────
@@ -240,32 +268,32 @@ New-Item -Path (Split-Path $Params.CSROutputPath) -ItemType Directory -Force | O
 $DNParts = [System.Collections.Generic.List[string]]::new()
 
 # 必填欄位
-$DNParts.Add("O=$($Params.CAOrganization)")
-$DNParts.Add("C=$($Params.CACountry)")
+$DNParts.Add("O=$($ADCSParams.CAOrganization)")
+$DNParts.Add("C=$($ADCSParams.CACountry)")
 
 # 選填欄位（有值才加入）
-if (-not [string]::IsNullOrWhiteSpace($Params.CAOU)) {
-    $DNParts.Insert(1, "OU=$($Params.CAOU)")
+if (-not [string]::IsNullOrWhiteSpace($ADCSParams.CAOU)) {
+    $DNParts.Insert(1, "OU=$($ADCSParams.CAOU)")
 }
-if (-not [string]::IsNullOrWhiteSpace($Params.CALocality)) {
-    $DNParts.Add("L=$($Params.CALocality)")
+if (-not [string]::IsNullOrWhiteSpace($ADCSParams.CALocality)) {
+    $DNParts.Add("L=$($ADCSParams.CALocality)")
 }
-if (-not [string]::IsNullOrWhiteSpace($Params.CAState)) {
-    $DNParts.Add("ST=$($Params.CAState)")
+if (-not [string]::IsNullOrWhiteSpace($ADCSParams.CAState)) {
+    $DNParts.Add("ST=$($ADCSParams.CAState)")
 }
 
 # 從 DomainName 自動拆解 DC= 鏈（corp.foo.bar.tw → DC=corp,DC=foo,DC=bar,DC=tw）
-$DCParts = $Params.DomainName.Split('.') | ForEach-Object { "DC=$_" }
+$DCParts = $ADCSParams.DomainName.Split('.') | ForEach-Object { "DC=$_" }
 $DNParts.AddRange([string[]]$DCParts)
 
-# 組合為最終字串並寫回 $Params
-$Params.CADistinguishedNameSuffix = $DNParts -join ', '
+# 組合為最終字串並寫回 $ADCSParams
+$ADCSParams.CADistinguishedNameSuffix = $DNParts -join ', '
 
 Write-Host ""
 Write-Host "[DN] 組合後的 CADistinguishedNameSuffix："  -ForegroundColor Gray
-Write-Host "     $($Params.CADistinguishedNameSuffix)" -ForegroundColor Gray
+Write-Host "     $($ADCSParams.CADistinguishedNameSuffix)" -ForegroundColor Gray
 Write-Host "[DN] CSR 完整 DN 將為："                    -ForegroundColor Gray
-Write-Host "     CN=$($Params.CACommonName), $($Params.CADistinguishedNameSuffix)" -ForegroundColor Gray
+Write-Host "     CN=$($ADCSParams.CACommonName), $($ADCSParams.CADistinguishedNameSuffix)" -ForegroundColor Gray
 Write-Host ""
 #endregion
 
@@ -276,8 +304,8 @@ $ConfigData = @{
             NodeName                    = 'localhost'
             PSDscAllowPlainTextPassword = $false
             PSDscAllowDomainUser        = $true      # Enterprise Sub CA 需要網域帳號
-            CertificateFile             = $Params.CertificatePath
-            Thumbprint                  = $Params.CertificateThumbprint
+            CertificateFile             = $ADCSParams.CertificatePath
+            Thumbprint                  = $ADCSParams.CertificateThumbprint
         }
     )
 }
@@ -309,13 +337,13 @@ Write-Host @"
   AD CS 角色安裝完成，後續步驟：
 
   [Step 1] 將 CSR 檔案複製到離線 Root CA VM：
-           $($Params.CSROutputPath)
+           $($ADCSParams.CSROutputPath)
 
   [Step 2] 在 Root CA VM 執行 02_sign_intermediate.bat
            簽發 Subordinate CA 憑證
 
   [Step 3] 將簽回的憑證複製到：
-           $($Params.SignedCertPath)
+           $($ADCSParams.SignedCertPath)
 
   [Step 4] 執行 02_install_subcacert.ps1 完成 CA 憑證安裝
 

@@ -4,11 +4,13 @@
 #  執行時機：Root CA 簽回 .crt 憑證後，複製到本機再執行此腳本
 # ============================================================
 
-#region ── 參數區（統一從 CAConfig.psd1 讀取，請至該檔案修改參數）──
-# 本腳本用到的區塊：Global（CRL 發布目錄）、
-# ExchangePaths（Root CA / Sub CA 憑證交換路徑，與 01 共用同一份）
-. (Join-Path $PSScriptRoot 'Import-CAConfig.ps1')
-$Params = Merge-CAConfig -Sections 'Global','ExchangePaths'
+#region ── 參數區 ────────────────────────────────────────────
+$Params = @{
+    SignedCertPath  = 'C:\CAConfig\SubCA.crt'     # Root CA 簽回的憑證
+    RootCACertPath  = 'C:\CAConfig\RootCA.crt'    # Root CA 憑證
+    RootCACRLPath   = 'C:\CAConfig\RootCA.crl'    # Root CA CRL
+    CRLPublishPath  = 'C:\CRLPublish'             # CRL 發布目錄
+}
 #endregion
 
 Write-Host ""

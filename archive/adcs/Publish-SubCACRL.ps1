@@ -10,12 +10,23 @@
 #    4. 記錄執行結果至 Log 檔案
 # ============================================================
 
-#region ── 參數區（統一從 CAConfig.psd1 讀取，請至該檔案修改參數）──
-# 本腳本用到的區塊：Global（CRL 發布目錄，與 03 腳本共用同一份，
-# 不會出現兩邊各自維護、彼此不一致的情況）、
-# CRLPublish（Log 路徑/保留天數/CRL來源目錄）
-. (Join-Path $PSScriptRoot 'Import-CAConfig.ps1')
-$Params = Merge-CAConfig -Sections 'Global','CRLPublish'
+#region ── 參數區（請依實際環境修改） ────────────────────────
+$Params = @{
+    # ── CRL 發布目錄（需與 03_configure_cdp_aia.ps1 一致）──
+    CRLPublishPath  = 'C:\CRLPublish'
+
+    # ── Log 檔案路徑 ─────────────────────────────────────────
+    LogPath         = 'C:\CAConfig\Logs\CRL_Publish.log'
+
+    # ── Log 保留天數（超過此天數的 Log 自動清除）────────────
+    LogRetentionDays = 90
+
+    # ── CRL 來源目錄（CA 預設輸出位置）──────────────────────
+    CertEnrollPath  = 'C:\Windows\System32\CertSrv\CertEnroll'
+
+    # ── 警告閾值：CRL 到期前幾天發出警告 ────────────────────
+    CRLExpiryWarningDays = 3
+}
 #endregion
 
 # ── 初始化 Log ────────────────────────────────────────────────

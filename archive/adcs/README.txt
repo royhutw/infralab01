@@ -4,36 +4,15 @@
   架構：離線 Root CA → Enterprise Sub CA（corp.foo.bar.tw）
 ================================================================
 
+本版為重構前經測試可運作版本
+
 一、檔案清單與執行順序
 ────────────────────────────────────────────────────────────────
-  CAConfig.psd1                    共用參數設定檔（唯一參數來源，
-                                    所有 .ps1 皆從此讀取，請勿在個別
-                                    腳本內另外寫死參數）
-  Import-CAConfig.ps1              共用參數載入器（各腳本自動呼叫，
-                                    不需要手動執行）
-
-  ── 初次部署（依序執行）──────────────────────────────────────
   01_install_adcs_dsc.ps1          安裝 AD CS 角色，產生 CSR
   02_install_subcacert.ps1         安裝 Root CA 簽回的憑證
   03_configure_cdp_aia.ps1         設定 CDP / AIA 發布點
   04_create_templates.ps1          建立 EAP-TLS 憑證範本
-  05_configure_autoenrollment_gpo.ps1  設定憑證 Auto-Enrollment GPO
-  06_Deploy-RootCACert.ps1         透過 GPO 部署 Root CA 憑證至所有電腦
-
-  ── 上線後定期維運 ────────────────────────────────────────────
-  Publish-SubCACRL.ps1             Sub CA CRL 定期發布（供排程呼叫）
-  Register-CRLScheduledTask.ps1    建立每週執行 Publish-SubCACRL.ps1
-                                    的 Windows 排程工作（只需執行一次）
-
-  ── Sub CA 憑證到期 / 需要換金鑰時 ──────────────────────────
-  07_renew_subcacert.ps1           重新產生 Private Key 與 CSR，
-                                    完成後回到「二、完整部署流程」的
-                                    Root CA 簽發與 02、03 步驟重新走一次
-
-  【重要】所有網域名稱 / CA 名稱 / DN 欄位 / 路徑 / GPO 名稱 /
-  排程時間等設定，一律只在 CAConfig.psd1 修改，不要在個別 .ps1
-  裡另外修改，以免出現兩份不一致的設定值。CAConfig.psd1 與
-  Import-CAConfig.ps1 必須跟所有 .ps1 放在同一個目錄。
+  05_configure_autoenrollment_gpo.ps1  設定 Auto-Enrollment GPO
 
 
 二、完整部署流程
@@ -73,19 +52,8 @@
   [DC 或 AD CS 伺服器] 執行 05_configure_autoenrollment_gpo.ps1
         → 建立並套用 Auto-Enrollment GPO
         ↓
-  [DC 或 AD CS 伺服器] 執行 06_Deploy-RootCACert.ps1
-        → 透過 GPO 將 Root CA 憑證部署到網域所有電腦的
-          「受信任的根憑證授權單位」存放區
-          （用戶端需信任 Root CA，才能真正信任 Sub CA 簽發的憑證）
-        ↓
-  [AD CS 伺服器] 將 Publish-SubCACRL.ps1 複製到 C:\CAConfig\，
-                 執行 Register-CRLScheduledTask.ps1
-        → 建立每週一凌晨 02:00 自動發布 Sub CA CRL 的排程工作
-          （CRL 有效期僅 1 週，務必設定排程，否則到期後
-            用戶端會因無法驗證憑證是否遭撤銷而拒絕連線）
-        ↓
   [用戶端] gpupdate /force
-        → 自動信任 Root CA、自動申請 EAP-TLS 電腦與使用者憑證
+        → 自動申請 EAP-TLS 電腦與使用者憑證
 
 
 三、憑證範本說明
@@ -149,45 +117,15 @@
 
 六、CRL 發布排程
 ────────────────────────────────────────────────────────────────
-  Sub CA CRL：每週自動更新
-    → 由 Register-CRLScheduledTask.ps1 建立的排程工作，
-      每週一凌晨 02:00 自動執行 Publish-SubCACRL.ps1
-      （見「一、檔案清單」的「上線後定期維運」）
-    手動立即執行一次：
-      Start-ScheduledTask -TaskName 'PKI - Publish Subordinate CA CRL' `
-          -TaskPath '\PKI\'
-    查看執行紀錄：
-      Get-Content 'C:\CAConfig\Logs\CRL_Publish.log' -Tail 50
-
+  Sub CA CRL：每週自動更新（certutil -crl 或排程工作）
   Root CA CRL：每年手動上線更新（執行 Root CA 的 03_renew_crl.bat）
 
-
-七、Sub CA 憑證更新（Renewal）
-────────────────────────────────────────────────────────────────
-  適用時機：Sub CA 憑證即將到期、需要更換 CDP/AIA URL、
-            或基於安全考量主動汰換金鑰時。
-
-  [AD CS 伺服器] 執行 07_renew_subcacert.ps1
-        → 停止 CA 服務、備份現有憑證、清除舊憑證與金鑰、
-          產生全新 Private Key 與 CSR
-        ↓
-  [USB] 將新 CSR 複製到離線 Root CA VM：
-        C:\RootCA\requests\intermediateCA.csr
-        ↓
-  [Root CA VM] 若需更換 CDP URL，先修改 ca-env.bat 的 CA_CRL_URL
-               （見 Root CA 端 README「八、CRL Distribution Point」）
-               若舊憑證仍有效，先執行 04_revoke_cert.bat 撤銷
-               執行 02_sign_intermediate.bat 重新簽發
-        ↓
-  [USB] 將簽回的憑證複製回 AD CS 伺服器，改名為
-        C:\CAConfig\SubCA_renewal.crt
-        ↓
-  [AD CS 伺服器] 執行 02_install_subcacert.ps1 安裝新憑證
-                 執行 03_configure_cdp_aia.ps1 更新 CDP/AIA 設定
-                （若有異動）
+  建議設定 Windows 排程工作定期執行：
+    certutil -crl
+    xcopy C:\Windows\System32\CertSrv\CertEnroll\*.crl C:\CRLPublish\ /Y
 
 
-八、驗證指令
+七、驗證指令
 ────────────────────────────────────────────────────────────────
   # 確認 CA 狀態
   certutil -ping
@@ -203,6 +141,5 @@
 
   # 查看 Auto-Enrollment 事件記錄
   Get-WinEvent -LogName 'Microsoft-Windows-CertificateServicesClient-AutoEnrollment/Operational'
-
 
 ================================================================

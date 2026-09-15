@@ -186,25 +186,71 @@
 #      Enroll/Autoenroll權限則維持原本收斂的範圍不變。
 # ============================================================
 
-#region ── 參數區（統一從 CAConfig.psd1 讀取，請至該檔案修改參數）──
-# 本腳本用到的區塊：Global（網域名稱，dsacls 用）、
-# Templates（範本名稱、金鑰長度、NPS群組、有效期/更新期 Ticks）
-#
-# 有效期／更新期 Ticks 的計算公式與 75% 更新期上限的完整說明，
-# 保留在下方 v3/v4 修正記錄與各範本建立區塊的註解中，數值本身
-# 已移至 CAConfig.psd1 的 Templates 區塊，改值請至該檔案。
-. (Join-Path $PSScriptRoot 'Import-CAConfig.ps1')
-$Params = Merge-CAConfig -Sections 'Global','Templates'
+#region ── 參數區（請依實際環境修改） ────────────────────────
+$Params = @{
+    DomainName      = 'corp.foo.bar.tw'
+    NetBIOSDomainName = 'CORP'   # ← dsacls需要NetBIOS格式網域名稱，請依實際環境修改
+    DomainDN        = 'DC=corp,DC=foo,DC=bar,DC=tw'
 
-# Ticks 數值在 psd1 中已是 [long] 相容的整數字面值，這裡強制轉型
-# 確保型別正確（Import-PowerShellDataFile 讀入的數字預設為 [int]，
-# 若超出 Int32 範圍會出錯，故顯式轉為 [long]）。
-$Params.ComputerValidityTicks = [long]$Params.ComputerValidityTicks
-$Params.ComputerRenewalTicks  = [long]$Params.ComputerRenewalTicks
-$Params.UserValidityTicks     = [long]$Params.UserValidityTicks
-$Params.NPSValidityTicks      = [long]$Params.NPSValidityTicks
-$Params.UserRenewalTicks      = [long]$Params.UserRenewalTicks
-$Params.NPSRenewalTicks       = [long]$Params.NPSRenewalTicks
+    # ── 來源範本名稱（內建範本，複製基礎用）────────────────
+    SourceComputer  = 'Machine'     # 內建電腦範本
+    SourceUser      = 'User'        # 內建使用者範本
+    SourceNPS       = 'WebServer'   # 內建 Web 伺服器範本（含 Server Auth EKU）
+
+    # ── 新範本名稱 ───────────────────────────────────────────
+    ComputerTemplateName    = 'EAP-TLS-Computer'
+    ComputerTemplateDisplay = 'EAP-TLS Computer Certificate'
+    UserTemplateName        = 'EAP-TLS-User'
+    UserTemplateDisplay     = 'EAP-TLS User Certificate'
+    NPSTemplateName         = 'EAP-TLS-NPS-Server'
+    NPSTemplateDisplay      = 'EAP-TLS NPS Server Certificate'
+
+    # ── 金鑰設定 ─────────────────────────────────────────────
+    KeyLength               = 4096
+
+    # ── NPS 伺服器專屬安全群組（本次新增，用於最小權限控管）──
+    #  請將實際兩台 NPS 伺服器的「電腦帳號名稱」填入下方陣列
+    #  （AD Computer Name，不含網域尾碼、不含結尾的 $ 符號）
+    NPSServersGroupName     = 'NPS-Servers'
+    NPSServerComputerNames  = @('RADIUS1')   # ← 目前僅一台NPS伺服器，日後新增第二台請把主機名稱加進此陣列
+
+    # ── 憑證有效期（Windows FILETIME 負值，單位：100 奈秒）──
+    #
+    #  格式說明：
+    #    Windows 憑證範本使用負值 FILETIME 表示相對時間，
+    #    計算公式：天數 × 24 × 3600 × 10,000,000（100奈秒/秒）
+    #    並取負值（代表「從現在起往後」的時間間隔）
+    #
+    #  重要：BitConverter.GetBytes() 在 x64 Windows 上為小端序，
+    #         不可再加 [Array]::Reverse()，否則 Windows 無法正確讀取
+    #
+    # Computer：1 年 = 365 天
+    #   365 × 24 × 3600 × 10000000 = 315,360,000,000,000
+    ComputerValidityTicks   = [long]-315360000000000
+
+    # ── Renewal Period 上限說明（本次修正，重要）───────────
+    #
+    #  實測發現：透過 MMC 編輯範本時，Windows CA 會強制要求
+    #  Renewal Period 不得超過 Validity Period 的 75%，超過會
+    #  跳出警告「renewal period is larger than the maximum
+    #  allowed」，並提示自動改為上限值。
+    #
+    #  舊版腳本誤用 80% 計算 Renewal，超過此上限，已修正為 75%。
+    #
+    #  Computer Renewal：有效期 75% = 273.75 天 = 6,570 小時
+    #    6570 × 3600 × 10000000 = 236,520,000,000,000
+    ComputerRenewalTicks    = [long]-236520000000000
+
+    # User / NPS：2 年 = 730 天
+    #   730 × 24 × 3600 × 10000000 = 630,720,000,000,000
+    UserValidityTicks       = [long]-630720000000000
+    NPSValidityTicks        = [long]-630720000000000
+
+    # User / NPS Renewal：有效期 75% = 547.5 天 = 13,140 小時
+    #   13140 × 3600 × 10000000 = 473,040,000,000,000
+    UserRenewalTicks        = [long]-473040000000000
+    NPSRenewalTicks         = [long]-473040000000000
+}
 #endregion
 
 # ── 確認並安裝 RSAT-AD-PowerShell ────────────────────────────

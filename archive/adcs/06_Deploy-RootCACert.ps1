@@ -1,8 +1,5 @@
 ﻿# ============================================================
-#  06_Deploy-RootCACert.ps1
-#  （修正：原檔頭註解遺漏檔名編號前綴，已補上，與檔案實際
-#    名稱 06_Deploy-RootCACert.ps1 一致，避免與 07 混淆）
-#
+#  Deploy-RootCACert.ps1
 #  將 Root CA 憑證部署到網域內所有電腦的
 #  受信任根憑證授權單位（Trusted Root Certification Authorities）存放區
 #
@@ -15,15 +12,27 @@
 #  執行身份：Domain Admins / Enterprise Admins
 # ============================================================
 
-#region ── 參數區（統一從 CAConfig.psd1 讀取，請至該檔案修改參數）──
-# 本腳本用到的區塊：Global（網域名稱/DN、Root CA 憑證路徑）、
-# DeployRootCAGPO（GPO名稱/說明/登錄路徑）
-. (Join-Path $PSScriptRoot 'Import-CAConfig.ps1')
-$Params = Merge-CAConfig -Sections 'Global','ExchangePaths','DeployRootCAGPO'
+#region ── 參數區（請依實際環境修改） ────────────────────────
+$Params = @{
+    # ── 網域設定 ─────────────────────────────────────────────
+    DomainName      = 'corp.foo.bar.tw'
+    DomainDN        = 'DC=corp,DC=foo,DC=bar,DC=tw'
 
-# ── 套用目標（網域根層級，涵蓋所有電腦）────────────────────
-# 直接沿用 Global.DomainDN，不再另外重複定義一份一樣的 DN 字串。
-$Params.GPOTarget = $Params.DomainDN
+    # ── Root CA 憑證路徑 ─────────────────────────────────────
+    # 請將 RootCA.crt 複製到 DC 可存取的路徑
+    RootCACertPath  = 'C:\CAConfig\RootCA.crt'
+
+    # ── GPO 設定 ─────────────────────────────────────────────
+    GPOName         = 'PKI - Deploy Root CA Certificate'
+    GPOComment      = '部署 Root CA 憑證至所有電腦受信任根憑證存放區'
+
+    # ── 套用目標（網域根層級，涵蓋所有電腦）────────────────
+    GPOTarget       = 'DC=corp,DC=foo,DC=bar,DC=tw'
+
+    # ── 憑證部署的登錄路徑（GPO 使用此路徑寫入憑證）────────
+    # 此為 GPO 內部使用的固定路徑，一般不需修改
+    TrustedRootStore = 'HKLM\SOFTWARE\Policies\Microsoft\SystemCertificates\Root\Certificates'
+}
 #endregion
 
 Write-Host ""
@@ -133,10 +142,7 @@ $CertHex = ($CertBytes | ForEach-Object { $_.ToString('X2') }) -join ''
 
 # 寫入 GPO 登錄值（電腦設定）
 # 路徑對應：受信任的根憑證授權單位 → 憑證
-# （修正：原本這裡直接寫死登錄路徑字串，與參數區定義的
-#   TrustedRootStore 完全無關，改成實際引用該參數，
-#   避免兩處各自維護、以後修改其中一處卻忘了改另一處）
-$RegKey   = "$($Params.TrustedRootStore)\$CertThumbprint"
+$RegKey   = "HKLM\SOFTWARE\Policies\Microsoft\SystemCertificates\Root\Certificates\$CertThumbprint"
 
 # Blob 格式：3 個固定 DWORD + 憑證原始資料
 # DWORD 1：0x00000001（憑證類型）

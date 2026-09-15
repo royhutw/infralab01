@@ -9,16 +9,34 @@
 #    用戶端透過此 URL 下載 CA 憑證以建立信任鏈
 # ============================================================
 
-#region ── 參數區（統一從 CAConfig.psd1 讀取，請至該檔案修改參數）──
-# 本腳本用到的區塊：Global（CRL發布目錄、CDP/AIA URL）、
-# CRLPolicy（CRL/Delta CRL 基本週期，與01對照的同一份設定）、
-# CDPAIA（CRL重疊緩衝期、憑證最大有效期）
-#
-# 【提醒】原本這裡的 CAName 參數其實從未在本腳本內被使用
-# （CA 是透過下方 certutil -getconfig 動態取得，不是靠這個參數），
-# 已一併移除，避免誤導。
-. (Join-Path $PSScriptRoot 'Import-CAConfig.ps1')
-$Params = Merge-CAConfig -Sections 'Global','CRLPolicy','CDPAIA'
+#region ── 參數區（請依實際環境修改） ────────────────────────
+$Params = @{
+    # ── CA 識別名稱（需與安裝時設定一致）────────────────────
+    CAName          = 'corp-foo-bar-tw-SubCA'
+
+    # ── CRL 發布目錄（IIS 需指向此目錄提供靜態下載）─────────
+    CRLPublishPath  = 'C:\CRLPublish'
+
+    # ── 對外 HTTP 發布 URL（需可被所有用戶端存取）────────────
+    CDPHttpUrl      = 'http://crl.corp.foo.bar.tw/CRL'
+    AIAHttpUrl      = 'http://crl.corp.foo.bar.tw/AIA'
+
+    # ── CRL 更新設定 ─────────────────────────────────────────
+    # CRL 有效期：建議 1~4 週
+    CRLPeriodUnits      = 1
+    CRLPeriod           = 'Weeks'    # Days / Weeks / Months
+    CRLOverlapUnits     = 12         # CRL 重疊緩衝期（小時），確保新舊 CRL 銜接
+    CRLOverlapPeriod    = 'Hours'
+
+    # Delta CRL：更頻繁發布的差異 CRL，降低撤銷延遲
+    CRLDeltaPeriodUnits = 1
+    CRLDeltaPeriod      = 'Days'
+
+    # ── 憑證有效期上限（CA 不可簽發超過此期限的憑證）────────
+    # Computer 憑證 1 年，User 憑證 2 年，設為 2 年以容納兩者
+    ValidityPeriodUnits = 2
+    ValidityPeriod      = 'Years'
+}
 #endregion
 
 Write-Host ""
