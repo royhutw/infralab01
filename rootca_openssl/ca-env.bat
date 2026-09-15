@@ -33,10 +33,10 @@ set CRL_DAYS=400
 :: 這些值會透過 $ENV:: 被 openssl-rootca.cnf 的
 :: [req_distinguished_name] 區塊直接引用，兩邊不會不一致。
 set CA_COUNTRY=TW
-set CA_STATE=Taiwan
-set CA_LOCALITY=Taipei
+set CA_STATE=
+set CA_LOCALITY=
 set CA_ORG=MyOrg Ltd
-set CA_OU=IT Department
+set CA_OU=
 set CA_CN=MyOrg Root CA
 
 :: ── CRL 發布 URL ──────────────────────────────────────────────
