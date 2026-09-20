@@ -648,6 +648,22 @@ authentication event server dead action authorize voice
 
 ---
 
+### 9.10 全面採用`authentication violation replace`（含Multi-Domain Port），取代原本的`restrict`
+
+**決策**：Edge Switch所有Port（含Single-Host一般辦公桌Port，以及`Gi0/2`這類IP Phone+PC共接的Multi-Domain Port）的`authentication violation`，統一改為`replace`，不再使用`restrict`。
+
+**決策背景**：`Gi1/0/4`實測發現（詳見情境C相關排錯經驗），原本使用`restrict`（或`protect`）時，Port換插不同裝置後會卡在違規狀態、新裝置完全上不了網，必須人工`shutdown`/`no shutdown`介入才能恢復。改用`replace`後，交換器會自動終止舊MAC的認證階段，對新MAC重新發起完整的802.1X/MAB認證流程，不需要人工介入。
+
+**兩種violation模式的本質差異（重要，非資安層面的差異）**：不論`restrict`或`replace`，新裝置都必須通過802.1X/MAB驗證才能取得網路存取，**沒有任何一種模式會讓新裝置繞過驗證**。兩者真正的差異僅在於違規觸發當下，是否犧牲「原本已在線上、正常運作的裝置」：
+- `restrict`／`protect`：保留原裝置的認證階段，新裝置的流量被擋下，但也代表新裝置完全上不了線，需人工介入
+- `replace`：終止原裝置的認證階段，換新裝置重新走一次認證——若原裝置其實還在正常使用（未真的被移除），會被無預警斷線
+
+**為何`Gi0/2`（Multi-Domain）也採用`replace`**：`Gi0/2`的Data Domain（IP Phone後方的PC插孔）在實際使用情境中確實會不定期更換電腦。若維持`restrict`，每次更換PC都需要人工到Switch上介入才能恢復連線，不符合實際運作需求；改用`replace`後，換裝置可自動完成重新認證，不需要人工介入，權衡下更符合本環境的實際使用模式。**Voice Domain（IP Phone本身）不受此設定影響**——IP Phone的Voice VLAN指派由`switchport voice vlan`搭配CDP/LLDP-MED獨立處理（詳見9.9節），與Data Domain的802.1X/MAB認證流程互不干擾，`replace`僅影響Data Domain換裝置時的行為。
+
+**已知的可用性取捨（非資安風險，但需知悉）**：`replace`的代價是「Multi-Domain Port的Data Domain若遭遇非預期的裝置插入（例如接錯線、或惡意接入），原本正常使用中的PC會被無預警斷線」，即使新裝置最終認證失敗，原PC的連線已經被中斷。此為刻意接受的可用性取捨，換取換裝置時不需要人工介入的維運便利性。若未來評估此斷線頻率造成困擾，可重新考慮針對Multi-Domain Port單獨改回`restrict`（Single-Host Port不受影響，可繼續維持`replace`）。
+
+---
+
 - 本SOP基於IOU Lab環境設計，部分指令（如CoPP硬體驗證、NBAR protocol比對）在正式Catalyst設備上行為可能與Lab不同，正式上線前建議重新驗證一次。
 - 建議將「每日巡檢」項目未來納入自動化腳本（如Python + Netmiko/Paramiko定期抓取並比對），減少人工執行負擔並能更早發現異常趨勢。
 - NPS本身不支援RADIUS CoA，因此「情境D」中RADIUS恢復後的Port重新認證，依賴的是Switch端`authentication event server alive action reinitialize`機制，而非NPS主動推播，這點在教育維運人員時需特別說明清楚。
