@@ -384,7 +384,7 @@ interface GigabitEthernet0/2
  authentication order dot1x mab
  authentication priority dot1x mab
  authentication port-control auto
- authentication violation restrict
+ authentication violation replace
  mab
  dot1x pae authenticator
  dot1x timeout tx-period 5
@@ -440,7 +440,7 @@ interface GigabitEthernet0/3
  authentication timer reauthenticate server
  authentication host-mode single-host
  authentication timer restart 30
- authentication violation restrict
+ authentication violation replace
  mab
  dot1x pae authenticator
  dot1x timeout tx-period 5
