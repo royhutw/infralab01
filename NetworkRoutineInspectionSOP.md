@@ -664,7 +664,99 @@ authentication event server dead action authorize voice
 
 ---
 
-- 本SOP基於IOU Lab環境設計，部分指令（如CoPP硬體驗證、NBAR protocol比對）在正式Catalyst設備上行為可能與Lab不同，正式上線前建議重新驗證一次。
+## 十、NPS Policy建置Checklist（附錄）
+
+目的：在`nps.msc`圖形介面手動建立Network Policy時的逐條對照表。微軟原生NPS PowerShell模組（`06_configure_radius_clients.ps1`使用的`NPS`模組）僅提供RADIUS Client相關Cmdlet（`New/Get/Set/Remove-NpsRadiusClient`），並未提供可參數化建立Network Policy的Cmdlet，因此Policy仍須依本checklist於GUI手動建立；建立並測試通過後，改用`Export-NpsConfiguration`匯出備份，以利未來複製到NPS-2（詳見九、9.7節MAB治理架構的延伸應用）。
+
+**建立順序（務必依此順序排列，順序錯誤會導致政策互相攔截，詳見九、9.8節實測案例）**：
+
+| 順序 | Policy名稱 | 用途 |
+|---|---|---|
+| 1 | `10-Machine-EAPTLS` | 機器身份認證 |
+| 2 | `20-User-EAPTLS` | 使用者身份認證 |
+| 3 | `30-MAB-Registration` | 新機過渡期 |
+| 4 | `40-MAB-Printers` | 網路印表機 |
+| 5 | `50-MAB-IoT` | 門禁/考勤/IP Cam/NVR |
+| 6 | `90-HQ-VLAN90-Guest_asteriskMAB` | 訪客兜底（已建立，僅需確認順序） |
+| 7 | Deny All | NPS內建，維持最後一條 |
+
+政策名稱加數字前綴，方便在NPS主控台清單裡一眼辨識排列順序。
+
+### 10.1 政策1、2：Machine / User Authentication（EAP-TLS）
+
+⚠️ 這兩條為既有政策，重點是**補上EAP Type條件**——回顧9.8節實測案例，缺少此條件會導致MAB流量被這兩條政策誤收並拒絕。
+
+| 頁籤 | 設定項目 | 值 |
+|---|---|---|
+| Overview | Policy Name | `10-Machine-EAPTLS`（或既有名稱） |
+| | Policy State | Enabled |
+| | Type of network access server | Unspecified（或依交換器Vendor調整） |
+| Conditions | ✅ 新增：EAP Types | Smart Card or other certificate |
+| | Windows Groups（Machine用） | `CORP\Domain Computers` |
+| | Windows Groups（User用，另一條政策） | `CORP\Domain Users` |
+| Constraints → Authentication Methods | 勾選 | EAP Types → Microsoft: Smart Card or other certificate |
+| | 憑證來源 | 選擇EAP-TLS-NPS-Server憑證（NPS自己的伺服器憑證） |
+| Settings → RADIUS Attributes → Standard | Tunnel-Type | Virtual LANs (VLAN) |
+| | Tunnel-Medium-Type | 802 (includes all 802 media plus Ethernet canonical format) |
+| | Tunnel-Pvt-Group-ID | 依機器/使用者所屬部門動態指派；若目前為單一固定VLAN，直接填入對應編號 |
+
+**待確認事項（NAS-Port-Type，有線/無線共用問題）**：檢查這兩條政策的Conditions是否殘留`NAS-Port-Type = Ethernet`限制——若有，Wi-Fi裝置（Port-Type為`Wireless - IEEE 802.11`）會不符合條件，導致企業SSID完全連不上。若無此限制，有線/無線可共用同一條；若有，需決定拿掉限制或另建一份Wireless專用政策。
+
+### 10.2 政策3：MAB-Registration（新機過渡期）
+
+| 頁籤 | 設定項目 | 值 |
+|---|---|---|
+| Overview | Policy Name | `30-MAB-Registration` |
+| | Policy State | Enabled |
+| Conditions | Windows Groups | `CORP\MAB-Registration` |
+| Constraints → Authentication Methods | 勾選 | Unencrypted authentication (PAP, SPAP) |
+| | 其餘EAP選項 | 不勾選 |
+| Settings → RADIUS Attributes → Standard | Tunnel-Type | Virtual LANs (VLAN) |
+| | Tunnel-Medium-Type | 802 (includes all 802 media plus Ethernet canonical format) |
+| | Tunnel-Pvt-Group-ID | `40` |
+
+### 10.3 政策4：MAB-Printers
+
+| 頁籤 | 設定項目 | 值 |
+|---|---|---|
+| Overview | Policy Name | `40-MAB-Printers` |
+| | Policy State | Enabled |
+| Conditions | Windows Groups | `CORP\MAB-Printers` |
+| Constraints → Authentication Methods | 勾選 | Unencrypted authentication (PAP, SPAP) |
+| Settings → RADIUS Attributes → Standard | Tunnel-Type | Virtual LANs (VLAN) |
+| | Tunnel-Medium-Type | 802 (includes all 802 media plus Ethernet canonical format) |
+| | Tunnel-Pvt-Group-ID | `35` |
+
+### 10.4 政策5：MAB-IoT
+
+| 頁籤 | 設定項目 | 值 |
+|---|---|---|
+| Overview | Policy Name | `50-MAB-IoT` |
+| | Policy State | Enabled |
+| Conditions | Windows Groups | `CORP\MAB-IoT` |
+| Constraints → Authentication Methods | 勾選 | Unencrypted authentication (PAP, SPAP) |
+| Settings → RADIUS Attributes → Standard | Tunnel-Type | Virtual LANs (VLAN) |
+| | Tunnel-Medium-Type | 802 (includes all 802 media plus Ethernet canonical format) |
+| | Tunnel-Pvt-Group-ID | `37` |
+
+### 10.5 政策6：Guest（既有，僅需確認順序）
+
+`90-HQ-VLAN90-Guest_asteriskMAB`——確認排在政策3、4、5**之後**，Deny All**之前**即可，內容不需異動。
+
+### 10.6 建立過程中的即時驗證
+
+每建完一條政策，立即執行以下兩步，不要等全部建完才一次驗證：
+
+1. 回到Policy清單，用滑鼠拖曳或右鍵Move Up/Move Down，確認順序與10.（開頭）總表一致
+2. 存檔前再次檢查Conditions頁籤裡的Windows Groups欄位群組名稱有無打錯字——**NPS不會在存檔時警告錯誤的群組名稱，打錯只會讓該政策永遠比對不到，卻不會跳出任何錯誤提示**，事後極難排查，務必在建立當下就仔細核對。
+
+### 10.7 全部建完後的整體驗證步驟
+
+1. 用一台已知的Printer/IoT測試裝置（或先用一台筆電手動修改MAC測試，若Lab環境允許）觸發MAB，於NPS事件記錄檢視器確認`Network Policy Name`欄位顯示的是預期的那一條
+2. 用一台已加入網域的機器測試EAP-TLS，確認**沒有**被前面任何一條MAB政策攔截
+3. 全部確認無誤後，才進入下一步：`Export-NpsConfiguration`備份，並準備複製到未來的NPS-2
+
+---
 - 建議將「每日巡檢」項目未來納入自動化腳本（如Python + Netmiko/Paramiko定期抓取並比對），減少人工執行負擔並能更早發現異常趨勢。
 - NPS本身不支援RADIUS CoA，因此「情境D」中RADIUS恢復後的Port重新認證，依賴的是Switch端`authentication event server alive action reinitialize`機制，而非NPS主動推播，這點在教育維運人員時需特別說明清楚。
 - Server Port（VM Host）目前採整段trust設計，已知的備選強化方向（ARP ACL）記錄於「九、已知的備選強化方向」9.1節，建議每次每月健檢覆盤虛擬化層防護狀態時一併參考，評估是否需要導入。
