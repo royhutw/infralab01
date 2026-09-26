@@ -757,6 +757,120 @@ authentication event server dead action authorize voice
 3. 全部確認無誤後，才進入下一步：`Export-NpsConfiguration`備份，並準備複製到未來的NPS-2
 
 ---
+
+## 十一、特權存取管理（PAM）架構決策
+
+目的：記錄Tier 0/Tier 1特權帳號、PAW（Privileged Access Workstation）、Apache Guacamole堡壘機這一整套特權存取管理架構的設計脈絡與決策理由。本章節性質與前面章節不同——前面多是Switch/AD CS/NPS的具體技術設定，本章節記錄的是**整體威脅模型與架構取捨的決策過程**，供未來檢視架構、或向稽核單位說明設計理念時參考。
+
+### 11.1 Machine Auth 與 User Auth 的風險模型差異
+
+802.1X/EAP-TLS的Machine Auth與User Auth，防範的是兩個不同層面的風險，時序上也不同：
+
+| | Machine Auth | User Auth |
+|---|---|---|
+| 驗證的問題 | 這是一台受信任的公司設備嗎？ | 現在操作這台設備的是誰？ |
+| 觸發時機 | 開機時、使用者登入前 | 使用者登入之後 |
+| 主要防範情境 | 未受管裝置（BYOD、個人筆電）直接接觸內網 | 設備遺失/被盜、共用工作站情境下的越權存取 |
+
+只做其中一項都會留下明顯破口：只做Machine Auth，任何人只要能碰到公司設備就能用網路；只做User Auth，員工可在自己的個人筆電上安裝憑證後繞過裝置納管政策。兩者疊加才是完整的縱深防禦，這也是本架構要求Tier 0 PAW必須同時通過Machine Auth（機器合法）與User Auth（使用者合法）兩關的理論基礎。
+
+### 11.2 PAW的實作形式：VM或實體機的風險權衡
+
+**決策**：PAW採用VM形式，安裝於一台專用的Tier 0 VM Host上，該VM Host本身的實體存取已被嚴格限制為僅受許可管理員可接觸。
+
+**決策背景**：微軟官方對PAW的建議傾向使用獨立實體硬體而非VM，主要疑慮是Hypervisor管理員理論上可繞過VM自身的802.1X驗證（直接讀取VM記憶體、做Snapshot/Clone、透過Hypervisor主控台直接連線）。**本架構之所以仍採用VM形式，前提是這台VM Host本身已被定位為Tier 0資產**——能實體接觸這台VM Host的人，本來就已經是Tier 0等級的授權對象，Hypervisor層級的風險因此被大幅緩解，而非被忽略。
+
+**採用VM而非實體機的理由**：需支援3-5位管理員各自擁有專屬PAW，VM形式在建立、複製Golden Template、日後汰換重建上遠比實體機有彈性且維護方便。
+
+**前提條件（必須同時成立，缺一不可）**：
+1. VM Host的實體存取管制，等級須與PAW本身對等（已成立）
+2. Hypervisor管理平面（vCenter/Hyper-V Manager等管理介面，非PAW VM自身網卡）本身也須納入與Tier 0同等級的網段隔離與存取限制，不可掛在一般管理網段——**此為後續待落實項目，非本次決策已完成事項**
+
+### 11.3 PAW VM的802.1X動態VLAN指派限制與PCI Passthrough/SR-IOV決策
+
+**問題**：Cisco 802.1X的動態VLAN指派，運作單位是「一個實體Access Port」，而VM Host連接Core Switch的Server Port是Trunk（因應多VLAN承載與Live Migration需求所設計，見九、9.1節）。Trunk Port本身不支援802.1X，Switch也無法針對Trunk後方個別VM的802.1X Session單獨做動態VLAN指派——這代表原本設計的「Machine Auth進過渡VLAN、User Auth登入後動態切至Tier 0 VLAN」機制，技術上無法直接套用於VM形式的PAW。
+
+**評估過的替代方案**：
+- 方案一：PCI Passthrough/SR-IOV，讓PAW VM網路流量完全繞過vSwitch/Trunk，直通實體網卡對應的Access Port，可完整套用Machine+User雙重驗證架構，代價是失去Live Migration能力
+- 方案二：VLAN固定，改用Hypervisor API腳本配合登入/登出事件動態搬移vNIC所屬Port Group，脫離802.1X架構獨立運作，設計複雜度高
+- 方案三：VM固定於Tier 0 VLAN，放棄網路層Machine/User動態區隔，完全依賴GPO層防護（詳見11.5節）
+
+**最終決策：採用方案一（PCI Passthrough / SR-IOV）**
+
+**決策依據**：
+- 本專用VM Host固定不動、無Live Migration需求（PAW本身不存放任何無法重建的資料或狀態，所有指令稿/工具集中存放於企業內部Forgejo/檔案伺服器；Host故障則以備用硬體重建，採「可拋棄式工作站」設計原則），因此犧牲Live Migration對本情境幾乎沒有實際代價
+- 管理員規模僅3-5人，PCI Passthrough每人需求一張獨立實體網卡（或SR-IOV虛擬功能）的硬體限制在此規模下完全可控
+- Hyper-V環境，需確認：BIOS/UEFI已啟用VT-d/IOMMU與SR-IOV；網卡與驅動確實支援SR-IOV（需查證確切型號規格，不可僅憑「企業級網卡應該支援」的推測）；External Virtual Switch建立當下即勾選「Enable SR-IOV」（Hyper-V限制此選項建立後無法回頭修改，須事先確定）
+
+**已知且接受的維運代價**（需列入日常維運SOP）：
+- 完全失去Live Migration，VM Host硬體維護需PAW VM配合關機，設定檔與PCI Bus/Device/Function位址綁定，搬遷需手動重新設定
+- 每台PAW VM占用一張實體網卡或一個SR-IOV虛擬功能，人數增加需對應增加硬體
+- Hypervisor Patch/升級後，Passthrough設定可能失效，**每次Patch後須逐一驗證各PAW VM的網卡Passthrough正常運作**（建議納入每月健檢項目）
+- vSwitch層級的封包擷取工具（如ESXi的pktcap-uw、或Hyper-V對應工具）對Passthrough流量完全失效，網路問題排查需回到VM作業系統內部或Switch端進行
+
+### 11.4 PAW專屬Edge Switch：獨立於Core Switch的理由
+
+**決策**：PAW VM Host（經PCI Passthrough後）採獨立的專用Edge Switch連接，不與Core Switch共用Port。
+
+**決策理由**：
+- **變更管理影響範圍隔離**：Core Switch承載全公司骨幹流量（Firewall、Core-3、Edge-200互聯），任何PAW相關Port的調整或除錯，若在Core Switch上操作，風險波及全公司；獨立設備將影響範圍縮小至PAW專用範疇
+- **維護窗口排程彈性**：Core Switch的維護需協調全公司可接受的離峰時段；獨立設備僅需與3-5位PAW使用者協調，可更頻繁進行韌體更新
+- **稽核與Log純淨度**：獨立設備的Log天生只涉及Tier 0相關活動，稽核/事件調查時無需從Core Switch大量Log中額外篩選
+- 呼應九、9.3節分層防護設計原則：不同信任等級資產應有各自對應的管理邊界，避免Core Switch因身兼多職而成為「牽一髮動全身」的樞紐
+
+（是否接Core Switch現有空Port，或另購專用Edge Switch，屬機房實體佈線與空間的務實考量，本架構選擇後者以利長期擴充。）
+
+### 11.5 循環依賴問題與解法：緊急實體PAW + 常態VM PAW的分工
+
+**問題（重要架構風險，需優先理解）**：若PAW完全依賴802.1X/RADIUS驗證才能使用，一旦RADIUS雙機或PAW專屬Switch本身故障，PAW會依Fail-Secure設計落入VLAN98受限網段（或直接斷網），而管理員原本要用PAW排查修復的對象，恰好就是RADIUS/Switch本身——形成「修復工具依賴於待修復系統」的循環依賴（Bootstrap Paradox），PAW在最需要被使用的緊急時刻反而最可能無法使用。
+
+**解法：建立完全獨立於主要802.1X/RADIUS路徑之外的緊急應變通道，而非讓主路徑「順便」也能在故障時運作**
+
+| 用途 | 形式 | 特性 |
+|---|---|---|
+| 緊急應變 | 實體PAW一台，置於機房，接Core Switch | 平時關機，不套用802.1X/EAP-TLS，完全獨立於RADIUS/專屬Switch之外；操作反應最佳；因不經Guacamole，操作紀錄留存困難 |
+| 常態維運 | PAW VM（每人一台），置於專用VM Host | 僅能透過Apache Guacamole連線，檔案傳輸與操作過程均可完整紀錄；操作反應略遜於實體機 |
+
+**設計精神**：兩套工具分別對應兩種不同信任模型——常態情境追求可視化治理（紀錄一切，事後可稽核回溯），緊急情境追求可用性優先（不依賴任何可能故障的中介系統）。此設計比起在Fail-Secure邏輯中額外開例外（曾評估但未採用的替代做法），兩套系統徹底分離、邏輯更簡單、也更易於向他人解釋與稽核說明。
+
+**待補強項目**：NPS伺服器與PAW專屬Edge Switch，均應保留Console/序列埠或獨立頻外管理介面（IPMI/iLO/iDRAC），作為即使核心服務故障、仍能不經網路直接排查修復的基本手段，此為本決策之基本前提，建議優先落實。
+
+### 11.6 特權帳號綁定特定PAW：以空間隔離取代動態JIT/JEA授權
+
+**背景與能力邊界的誠實評估**：Just-In-Time / Just-Enough-Access等動態時效性授權機制，通常需要專門的商用PAM產品（如CyberArk、Delinea等）方能做到令人滿意的可視化與治理程度；以現有人力與技術深度，自行拼湊此類機制多半難以達到滿意的可視化管理效果，且容易產生後續管理風險。此為能力邊界的誠實評估，非能力不足，而是此範疇本身即需要專門產品或可觀的自建投入。
+
+**決策：改用「特權帳號僅能從特定Tier PAW登入」取代動態授權**——Tier 0特權帳號設定僅能從Tier 0 PAW登入（GPO的`Allow log on locally`/`Allow log on through Remote Desktop Services`限定），Tier 1特權帳號比照限定於Tier 1 PAW。
+
+**設計價值**：即使特權帳號密碼外洩，攻擊者手上的帳密因缺少「從正確PAW登入」這個前提條件而無法使用，形同無效鑰匙。相較於追求複雜的動態JIT機制，此做法設定簡單、可視化程度高（登入來源一目了然）、且效果扎實，是本套PAM架構中設計層次最完整的一環。
+
+### 11.7 東西向流量管制
+
+Server之間的東西向存取，由防火牆（含各Server自身的本機防火牆設定）管制，此部分技術難度不高、可視化程度高，依一般最小權限原則落實即可，本身無特殊架構決策爭議，故不展開。
+
+### 11.8 Apache Guacamole MFA機制：Air-gapped TOTP裝置
+
+**設定**：Guacamole搭配公司配發的專用Android手機，安裝Google Authenticator做TOTP OTP驗證；此手機下載完App後即斷開網路（Air-gapped），平時上鎖存放於抽屜，僅於使用時取出、用畢歸還。
+
+**技術評估（各層防護逐一比對常見攻擊手法）**：
+
+| 攻擊手法 | 對此機制是否有效 | 原因 |
+|---|---|---|
+| SIM Swapping | 無效 | TOTP驗證碼由手機本地運算產生，不經電信商網路傳輸，與門號無關 |
+| MFA疲勞攻擊（Push轟炸） | 無效 | TOTP需管理員主動開啟App、手動抄錄數字輸入，非可被動轟炸同意的推播機制 |
+| 手機遺失/被盜導致金鑰外洩 | 風險大幅降低 | 手機平時鎖於抽屜，不隨員工個人攜帶外出，實體保管流程比照PAW等級的門禁邏輯 |
+| 雲端同步導致金鑰外洩（Google Authenticator近年新增功能） | 無效 | 手機Air-gapped，物理上無網路能力做任何雲端同步，此為裝置生命週期第一天即成立的物理性防護，優於「僅靠設定關閉同步」（設定屬軟體層防護，可能被誤開啟或被App更新改變預設值） |
+
+**結論**：此機制實質具備與硬體安全金鑰（如FIDO2/YubiKey）相近的防護等級——金鑰本質上只存在於一支從未連網的實體裝置中，需要真正的實體接觸才能取得。攻破此MFA需同時做到：取得帳密（社交工程/釣魚可達成）+ 實體侵入機房 + 打開上鎖抽屜 + 取得該手機，已超出純網路攻擊手段能達成的範圍，需具備實體滲透能力的高階威脅行為者方能做到。**「此MFA被攻破，大致等同於遭遇具實體滲透能力的高階威脅行為者（如國家級APT）」此一威脅模型判斷，於此設計下可視為合理成立**，並非自我安慰式的假設，而是有具體技術依據的評估。
+
+**待確認/待落實的流程面細節（不影響整體判斷，屬周邊強化）**：
+- 手機本身應設定螢幕鎖定（密碼/生物辨識），避免抽屜遭開啟後手機可直接被使用
+- 抽屜鑰匙/密碼的管理鏈，應與機房門禁管理維持同等嚴謹程度，避免此環節成為整條防線中相對薄弱的一環
+
+### 11.9 整體架構小結
+
+本套PAM架構，以Machine+User雙重驗證（802.1X/EAP-TLS）、PAW VM隔離（PCI Passthrough繞開Hypervisor共享風險）、實體PAW打破循環依賴、特權帳號綁定PAW（取代動態JIT/JEA）、Air-gapped TOTP（取代硬體金鑰）等一系列**用相對簡單、可視化程度高的機制組合**，在有限人力與預算下，達到與商用PAM方案相近的實質防護效果。其核心設計哲學是：不追求每一層都達到理論最強，而是透過多層組合，將攻擊者的實際攻擊成本拉高至超出現實威脅模型（一般犯罪集團、機會主義攻擊者）能負擔的範圍，並誠實承認其邊界所在（國家級/高階持續性威脅超出本架構防護能力，此為預算與威脅模型下的合理取捨，而非設計疏漏）。
+
+---
 - 建議將「每日巡檢」項目未來納入自動化腳本（如Python + Netmiko/Paramiko定期抓取並比對），減少人工執行負擔並能更早發現異常趨勢。
 - NPS本身不支援RADIUS CoA，因此「情境D」中RADIUS恢復後的Port重新認證，依賴的是Switch端`authentication event server alive action reinitialize`機制，而非NPS主動推播，這點在教育維運人員時需特別說明清楚。
 - Server Port（VM Host）目前採整段trust設計，已知的備選強化方向（ARP ACL）記錄於「九、已知的備選強化方向」9.1節，建議每次每月健檢覆盤虛擬化層防護狀態時一併參考，評估是否需要導入。
