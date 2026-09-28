@@ -295,6 +295,23 @@ interface GigabitEthernet0/1
  storm-control broadcast level pps 5000 3000
  storm-control multicast level pps 5000 3000
 
+ ! Core Switch 接 IP PBX (GigabitEthernet3/1)
+interface GigabitEthernet3/1
+ description IP PBX
+ switchport access vlan 38
+ switchport mode access
+ spanning-tree portfast
+ spanning-tree bpduguard enable
+ ip arp inspection trust
+ switchport port-security
+ switchport port-security maximum 1
+ ! 請將 0123.4567.89ab 自行替換為IP PBX實際的MAC Address
+ switchport port-security mac-address 0123.4567.89ab
+ switchport port-security violation restrict
+ ! IOU環境無須設定storm-control, Production 環境建議設定
+ storm-control broadcast level pps 5000 3000
+ storm-control multicast level pps 5000 3000
+
  ! Core Switch 接另一架 Core Switch Trunk (GigabitEthernet3/2)
 interface GigabitEthernet3/2
  description Downlink Trunk to Core Switch Extension (SW-HQ-Core-3)
