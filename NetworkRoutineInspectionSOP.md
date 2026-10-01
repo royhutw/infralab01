@@ -684,23 +684,26 @@ authentication event server dead action authorize voice
 
 ### 10.1 政策1、2：Machine / User Authentication（EAP-TLS）
 
-⚠️ 這兩條為既有政策，重點是**補上EAP Type條件**——回顧9.8節實測案例，缺少此條件會導致MAB流量被這兩條政策誤收並拒絕。
+⚠️ 這兩條為既有政策，重點是**補上EAP Type條件**——回顧九、9.8節實測案例，缺少此條件會導致MAB流量被這兩條政策誤收並拒絕。
 
 | 頁籤 | 設定項目 | 值 |
 |---|---|---|
-| Overview | Policy Name | `10-Machine-EAPTLS`（或既有名稱） |
+| Overview | Policy Name | `10-HQ-VLAN50-Machine-MachineAuth-EAPTLS`（實際命名慣例，取代原示意名稱`10-Machine-EAPTLS`） |
 | | Policy State | Enabled |
 | | Type of network access server | Unspecified（或依交換器Vendor調整） |
-| Conditions | ✅ 新增：EAP Types | Smart Card or other certificate |
+| Conditions | EAP Types | Smart Card or other certificate |
 | | Windows Groups（Machine用） | `CORP\Domain Computers` |
 | | Windows Groups（User用，另一條政策） | `CORP\Domain Users` |
 | Constraints → Authentication Methods | 勾選 | EAP Types → Microsoft: Smart Card or other certificate |
 | | 憑證來源 | 選擇EAP-TLS-NPS-Server憑證（NPS自己的伺服器憑證） |
+| Constraints → NAS Port Type（實測確認位置） | Common 802.1x connection tunnel types | **同時勾選 Ethernet 與 Wireless - IEEE 802.11**（已實測確認，非Conditions頁籤，而是Constraints頁籤內的獨立設定項） |
 | Settings → RADIUS Attributes → Standard | Tunnel-Type | Virtual LANs (VLAN) |
 | | Tunnel-Medium-Type | 802 (includes all 802 media plus Ethernet canonical format) |
 | | Tunnel-Pvt-Group-ID | 依機器/使用者所屬部門動態指派；若目前為單一固定VLAN，直接填入對應編號 |
 
-**待確認事項（NAS-Port-Type，有線/無線共用問題）**：檢查這兩條政策的Conditions是否殘留`NAS-Port-Type = Ethernet`限制——若有，Wi-Fi裝置（Port-Type為`Wireless - IEEE 802.11`）會不符合條件，導致企業SSID完全連不上。若無此限制，有線/無線可共用同一條；若有，需決定拿掉限制或另建一份Wireless專用政策。
+**NAS-Port-Type已確認解決（原「待確認事項」，現已實測驗證）**：Constraints頁籤的NAS Port Type設定，同時勾選Ethernet與Wireless - IEEE 802.11，有線與Wi-Fi裝置的Machine Auth可共用同一條政策，不需要另建Wireless專用政策。
+
+**PAW相關政策已不適用**：本表原規劃的Tier 0 PAW專屬Machine/User Auth政策（`21-HQ-VLAN21-T0PAW-MachineAuth`等），因PAW架構改為靜態VLAN指派（詳見十一、11.3節），**不再需要於NPS建立任何PAW相關政策**，PAW的網路層身份確認完全由Core Switch的Port-Security與pfSense防火牆規則承擔。
 
 ### 10.2 政策3：MAB-Registration（新機過渡期）
 
@@ -774,66 +777,70 @@ authentication event server dead action authorize voice
 
 只做其中一項都會留下明顯破口：只做Machine Auth，任何人只要能碰到公司設備就能用網路；只做User Auth，員工可在自己的個人筆電上安裝憑證後繞過裝置納管政策。兩者疊加才是完整的縱深防禦，這也是本架構要求Tier 0 PAW必須同時通過Machine Auth（機器合法）與User Auth（使用者合法）兩關的理論基礎。
 
-### 11.2 PAW的實作形式：VM或實體機的風險權衡
+### 11.2 PAW的實作形式：VM或實體機的風險權衡（已修訂，見版本沿革）
 
-**決策**：PAW採用VM形式，安裝於一台專用的Tier 0 VM Host上，該VM Host本身的實體存取已被嚴格限制為僅受許可管理員可接觸。
+**版本沿革**：本節原始決策（PAW VM + PCI Passthrough + 專屬Edge Switch + 802.1X雙重驗證）已由後續討論修訂為**靜態VLAN指派**，詳見11.3～11.4新版內容。本節保留原始風險權衡的判斷邏輯，因其論證基礎（VM Host本身須為Tier 0資產、能實體接觸者已是Tier 0授權對象）在新版設計中依然成立，僅實作手段改變。
 
-**決策背景**：微軟官方對PAW的建議傾向使用獨立實體硬體而非VM，主要疑慮是Hypervisor管理員理論上可繞過VM自身的802.1X驗證（直接讀取VM記憶體、做Snapshot/Clone、透過Hypervisor主控台直接連線）。**本架構之所以仍採用VM形式，前提是這台VM Host本身已被定位為Tier 0資產**——能實體接觸這台VM Host的人，本來就已經是Tier 0等級的授權對象，Hypervisor層級的風險因此被大幅緩解，而非被忽略。
+**現行決策**：Tier 0與Tier 1 PAW分別採用VM形式，安裝於**兩台各自獨立的專用實體VM Host**——Tier 0 PAW VM Host與Tier 1 PAW VM Host互不相關，各自的實體存取皆由Tier 0管理員負責管理（Tier 1 Host雖僅承載Tier 1等級的VM，其實體管理權責仍歸屬Tier 0管理員，以確保管理鏈的一致性）。
+
+**決策背景（沿用原始論證）**：微軟官方對PAW的建議傾向使用獨立實體硬體而非VM，主要疑慮是Hypervisor管理員理論上可繞過VM自身的網路層驗證（直接讀取VM記憶體、做Snapshot/Clone、透過Hypervisor主控台直接連線）。本架構之所以仍採用VM形式，前提是這兩台VM Host本身均已被定位為Tier 0資產，能實體接觸者本來就已是Tier 0等級的授權對象，Hypervisor層級的風險因此被大幅緩解。
 
 **採用VM而非實體機的理由**：需支援3-5位管理員各自擁有專屬PAW，VM形式在建立、複製Golden Template、日後汰換重建上遠比實體機有彈性且維護方便。
 
-**前提條件（必須同時成立，缺一不可）**：
-1. VM Host的實體存取管制，等級須與PAW本身對等（已成立）
-2. Hypervisor管理平面（vCenter/Hyper-V Manager等管理介面，非PAW VM自身網卡）本身也須納入與Tier 0同等級的網段隔離與存取限制，不可掛在一般管理網段——**此為後續待落實項目，非本次決策已完成事項**
+**Hypervisor管理平面的隔離（原11.2待落實項目，現已定案）**：兩台VM Host的Hyper-V管理IP均位於**VLAN 10**（Tier 0管理網段），與PAW VM自身的網路流量使用**不同的實體網卡**分開承載（Hyper-V外部虛擬交換器建立時，取消勾選「Allow management operating system to share this network adapter」，確保管理流量不與VM流量共用同一張網卡）。此設計滿足了原11.2節「Hypervisor管理平面須納入與Tier 0同等級網段隔離」的前提要求。
 
-### 11.3 PAW VM的802.1X動態VLAN指派限制與PCI Passthrough/SR-IOV決策
+### 11.3 PAW VM的網路存取設計：由「802.1X動態指派」改為「靜態VLAN指派」（重大修訂）
 
-**問題**：Cisco 802.1X的動態VLAN指派，運作單位是「一個實體Access Port」，而VM Host連接Core Switch的Server Port是Trunk（因應多VLAN承載與Live Migration需求所設計，見九、9.1節）。Trunk Port本身不支援802.1X，Switch也無法針對Trunk後方個別VM的802.1X Session單獨做動態VLAN指派——這代表原本設計的「Machine Auth進過渡VLAN、User Auth登入後動態切至Tier 0 VLAN」機制，技術上無法直接套用於VM形式的PAW。
+**原始設計與遇到的限制**：最初規劃PAW VM比照一般裝置，透過802.1X動態指派VLAN（Machine Auth進過渡VLAN、User Auth登入後動態切至Tier 0 VLAN），但Cisco 802.1X的動態VLAN指派運作單位是「一個實體Access Port」，VM若掛在Trunk後方（一般VM Host的Server Port設計），Switch無法針對個別VM的802.1X Session單獨動態指派VLAN。曾評估以PCI Passthrough/SR-IOV讓PAW VM網路流量直通實體網卡對應的Access Port以解決此限制。
 
-**評估過的替代方案**：
-- 方案一：PCI Passthrough/SR-IOV，讓PAW VM網路流量完全繞過vSwitch/Trunk，直通實體網卡對應的Access Port，可完整套用Machine+User雙重驗證架構，代價是失去Live Migration能力
-- 方案二：VLAN固定，改用Hypervisor API腳本配合登入/登出事件動態搬移vNIC所屬Port Group，脫離802.1X架構獨立運作，設計複雜度高
-- 方案三：VM固定於Tier 0 VLAN，放棄網路層Machine/User動態區隔，完全依賴GPO層防護（詳見11.5節）
+**修訂後決策：PAW VM放棄802.1X驗證，改用靜態VLAN指派**——Tier 0 PAW VM固定使用**VLAN 20**，Tier 1 PAW VM固定使用**VLAN 21**，皆透過Hyper-V外部虛擬交換器的Port Group直接對應，不經過RADIUS/NPS的任何動態判斷。
 
-**最終決策：採用方案一（PCI Passthrough / SR-IOV）**
+**修訂理由**：
+1. 靜態VLAN指派使**PCI Passthrough/SR-IOV不再有存在必要**——原本導入Passthrough的唯一目的是讓VM對應到獨立的802.1X Access Port，此需求已不存在。Hyper-V改用一般的外部虛擬交換器即可，一併免除了Passthrough原有的維運代價（Live Migration喪失、Patch後須逐一驗證網卡直通狀態、vSwitch層級除錯工具失效等，詳見本節「已取消項目」）
+2. 網路層的身份確認，改由**空間隔離**（VLAN 20/21各自獨立、Core Switch Port層級的Port-Security）與**帳號層級控制**（11.6節，特權帳號僅能登入特定Tier PAW）共同承擔，取代原本規劃的Machine+User雙重驗證機制
+3. 簡化了整體架構的故障排除路徑：PAW的可用性不再與NPS/RADIUS的健康狀況產生任何關聯（詳見11.5節修訂）
 
-**決策依據**：
-- 本專用VM Host固定不動、無Live Migration需求（PAW本身不存放任何無法重建的資料或狀態，所有指令稿/工具集中存放於企業內部Forgejo/檔案伺服器；Host故障則以備用硬體重建，採「可拋棄式工作站」設計原則），因此犧牲Live Migration對本情境幾乎沒有實際代價
-- 管理員規模僅3-5人，PCI Passthrough每人需求一張獨立實體網卡（或SR-IOV虛擬功能）的硬體限制在此規模下完全可控
-- Hyper-V環境，需確認：BIOS/UEFI已啟用VT-d/IOMMU與SR-IOV；網卡與驅動確實支援SR-IOV（需查證確切型號規格，不可僅憑「企業級網卡應該支援」的推測）；External Virtual Switch建立當下即勾選「Enable SR-IOV」（Hyper-V限制此選項建立後無法回頭修改，須事先確定）
+**已取消項目（原11.3節內容，因本次修訂而不再適用）**：PCI Passthrough/SR-IOV相關的BIOS/UEFI設定、Hyper-V External Virtual Switch的SR-IOV啟用、每台VM占用獨立實體網卡、Passthrough後失去Live Migration能力等，均因PAW VM改採一般虛擬網路而不再需要考慮。
 
-**已知且接受的維運代價**（需列入日常維運SOP）：
-- 完全失去Live Migration，VM Host硬體維護需PAW VM配合關機，設定檔與PCI Bus/Device/Function位址綁定，搬遷需手動重新設定
-- 每台PAW VM占用一張實體網卡或一個SR-IOV虛擬功能，人數增加需對應增加硬體
-- Hypervisor Patch/升級後，Passthrough設定可能失效，**每次Patch後須逐一驗證各PAW VM的網卡Passthrough正常運作**（建議納入每月健檢項目）
-- vSwitch層級的封包擷取工具（如ESXi的pktcap-uw、或Hyper-V對應工具）對Passthrough流量完全失效，網路問題排查需回到VM作業系統內部或Switch端進行
+### 11.4 PAW VM Host與緊急實體PAW的Core Switch Port設計（原「專屬Edge Switch」決策已推翻）
 
-### 11.4 PAW專屬Edge Switch：獨立於Core Switch的理由
+**版本沿革**：原決策為PAW VM Host採獨立專用Edge Switch連接，理由是變更管理影響範圍隔離、維護窗口彈性、稽核Log純淨度。**此決策已推翻，改為兩台VM Host與緊急實體PAW皆直接連接Core Switch**。
 
-**決策**：PAW VM Host（經PCI Passthrough後）採獨立的專用Edge Switch連接，不與Core Switch共用Port。
+**推翻理由**：PAW VM已不再依賴802.1X動態驗證（11.3節修訂），Port層級的設定回歸單純的靜態Access Port + Port-Security，複雜度大幅降低，原本擔心「PAW相關Port異動波及全公司骨幹」的疑慮相應減輕。且兩台Host均由Tier 0管理員管理、機房本身已有實體門禁，直接使用Core Switch可減少一台額外設備的採購與維護負擔。
 
-**決策理由**：
-- **變更管理影響範圍隔離**：Core Switch承載全公司骨幹流量（Firewall、Core-3、Edge-200互聯），任何PAW相關Port的調整或除錯，若在Core Switch上操作，風險波及全公司；獨立設備將影響範圍縮小至PAW專用範疇
-- **維護窗口排程彈性**：Core Switch的維護需協調全公司可接受的離峰時段；獨立設備僅需與3-5位PAW使用者協調，可更頻繁進行韌體更新
-- **稽核與Log純淨度**：獨立設備的Log天生只涉及Tier 0相關活動，稽核/事件調查時無需從Core Switch大量Log中額外篩選
-- 呼應九、9.3節分層防護設計原則：不同信任等級資產應有各自對應的管理邊界，避免Core Switch因身兼多職而成為「牽一髮動全身」的樞紐
+**Core Switch所需Port配置（共5個Access Port）**：
 
-（是否接Core Switch現有空Port，或另購專用Edge Switch，屬機房實體佈線與空間的務實考量，本架構選擇後者以利長期擴充。）
+| 用途 | VLAN | Port-Security maximum | 說明 |
+|---|---|---|---|
+| Tier 0 PAW VM Host管理網卡 | 10 | 1，綁定該網卡MAC | Hyper-V管理IP，與VM流量網卡分開 |
+| Tier 0 PAW VM Host的VM網卡 | 20 | 依規劃PAW VM總數，動態學習+設定aging | 不綁固定MAC，因Golden Template重建後vNIC MAC會變動 |
+| Tier 1 PAW VM Host管理網卡 | 10 | 1，綁定該網卡MAC | 同上 |
+| Tier 1 PAW VM Host的VM網卡 | 21 | 依規劃PAW VM總數，動態學習+設定aging | 同上 |
+| 緊急實體PAW | 20 | 1，綁定實體MAC | 平時可設為`shutdown`，需要時才`no shutdown`，兼具使用留痕效果 |
 
-### 11.5 循環依賴問題與解法：緊急實體PAW + 常態VM PAW的分工
+VM網卡Port務必設定`switchport port-security aging time`與`aging type inactivity`，避免舊VM的MAC長期佔用Secure MAC名額，導致重建數次後新VM無法取得學習名額。
 
-**問題（重要架構風險，需優先理解）**：若PAW完全依賴802.1X/RADIUS驗證才能使用，一旦RADIUS雙機或PAW專屬Switch本身故障，PAW會依Fail-Secure設計落入VLAN98受限網段（或直接斷網），而管理員原本要用PAW排查修復的對象，恰好就是RADIUS/Switch本身——形成「修復工具依賴於待修復系統」的循環依賴（Bootstrap Paradox），PAW在最需要被使用的緊急時刻反而最可能無法使用。
+**VLAN 21為本次新增，需同步補上的既有設定**：
+- Core-02、Core-3的全域VLAN宣告新增`vlan 21`
+- `spanning-tree vlan ... priority`清單納入21
+- Firewall Trunk（Gi0/0）、Core-3 Trunk（Gi3/2）的Allowed VLAN新增21（Edge Trunk不需要，PAW不掛在Edge Switch下）
+- DHCP Snooping／DAI清單**不**納入VLAN 20、21（比照VLAN10/25/30等既有Tier 0/1網段，皆為靜態IP，無需這兩項機制）
+- pfSense新增VLAN 21介面與對應防火牆規則
 
-**解法：建立完全獨立於主要802.1X/RADIUS路徑之外的緊急應變通道，而非讓主路徑「順便」也能在故障時運作**
+### 11.5 PAW不再依賴RADIUS：循環依賴問題的根本消除，緊急實體PAW角色轉換
+
+**原始問題（已消除，本節保留記錄供對照）**：原設計中PAW VM完全依賴802.1X/RADIUS驗證，一旦RADIUS雙機或PAW專屬Switch故障，PAW會被Fail-Secure機制鎖在受限網段，而管理員原本要用PAW排查修復的對象，恰好就是RADIUS/Switch本身，形成「修復工具依賴於待修復系統」的循環依賴（Bootstrap Paradox）。
+
+**現況（11.3節修訂後的結果）**：PAW VM改採靜態VLAN指派，**其網路可用性與NPS/RADIUS的健康狀況完全無關**，循環依賴問題已從根本上消除，不需要再靠額外機制迴避。
+
+**緊急實體PAW的角色轉換**：此設備原本的存在目的是「打破循環依賴」，現已不再適用；但**仍決定保留**，角色轉換為Guacamole堡壘機或PAW VM Host本身故障時的備援存取手段——即使PAW的網路層不再依賴RADIUS，仍可能因Guacamole服務中斷、或VM Host硬體故障，導致常態路徑無法使用，此時緊急實體PAW（不經Guacamole、直接接Core Switch VLAN 20）提供一條獨立於這些潛在故障點之外的備援路徑。
 
 | 用途 | 形式 | 特性 |
 |---|---|---|
-| 緊急應變 | 實體PAW一台，置於機房，接Core Switch | 平時關機，不套用802.1X/EAP-TLS，完全獨立於RADIUS/專屬Switch之外；操作反應最佳；因不經Guacamole，操作紀錄留存困難 |
-| 常態維運 | PAW VM（每人一台），置於專用VM Host | 僅能透過Apache Guacamole連線，檔案傳輸與操作過程均可完整紀錄；操作反應略遜於實體機 |
+| 緊急應變（備援對象：Guacamole／PAW VM Host故障） | 實體PAW一台，置於機房，接Core Switch VLAN 20 | 平時關機（或Port維持shutdown），不經Guacamole；操作反應最佳；因不經Guacamole，操作紀錄留存困難 |
+| 常態維運 | PAW VM（每人一台），置於各自Tier的專用VM Host | 僅能透過對應Tier的Guacamole連線（見11.9節雙堡壘機決策），檔案傳輸與操作過程均可完整紀錄 |
 
-**設計精神**：兩套工具分別對應兩種不同信任模型——常態情境追求可視化治理（紀錄一切，事後可稽核回溯），緊急情境追求可用性優先（不依賴任何可能故障的中介系統）。此設計比起在Fail-Secure邏輯中額外開例外（曾評估但未採用的替代做法），兩套系統徹底分離、邏輯更簡單、也更易於向他人解釋與稽核說明。
-
-**待補強項目**：NPS伺服器與PAW專屬Edge Switch，均應保留Console/序列埠或獨立頻外管理介面（IPMI/iLO/iDRAC），作為即使核心服務故障、仍能不經網路直接排查修復的基本手段，此為本決策之基本前提，建議優先落實。
+**待補強項目（原內容，仍然有效）**：NPS伺服器與Core Switch均應保留Console/序列埠或獨立頻外管理介面（IPMI/iLO/iDRAC），作為核心服務故障時仍能不經網路直接排查修復的基本手段。
 
 ### 11.6 特權帳號綁定特定PAW：以空間隔離取代動態JIT/JEA授權
 
@@ -847,9 +854,9 @@ authentication event server dead action authorize voice
 
 Server之間的東西向存取，由防火牆（含各Server自身的本機防火牆設定）管制，此部分技術難度不高、可視化程度高，依一般最小權限原則落實即可，本身無特殊架構決策爭議，故不展開。
 
-### 11.8 Apache Guacamole MFA機制：Air-gapped TOTP裝置
+### 11.8 Apache Guacamole MFA機制：Air-gapped TOTP裝置（已隨11.9雙堡壘機決策調整為每Tier各自獨立一套）
 
-**設定**：Guacamole搭配公司配發的專用Android手機，安裝Google Authenticator做TOTP OTP驗證；此手機下載完App後即斷開網路（Air-gapped），平時上鎖存放於抽屜，僅於使用時取出、用畢歸還。
+**設定**：Tier 0與Tier 1的Guacamole堡壘機（見11.9節）**各自搭配獨立的專用Android手機**，安裝TOTP驗證App（Google Authenticator／Microsoft Authenticator／Authy等），每支手機下載完App後即斷開網路（Air-gapped），平時上鎖存放於抽屜，僅於使用時取出、用畢歸還。Tier 0與Tier 1的手機**不可共用、不可放在同一個抽屜**，管理鏈需與各自Tier的PAW管理權責一致（兩台VM Host均由Tier 0管理員負責管理，故兩支MFA手機的保管責任亦歸屬Tier 0管理員，但實體存放建議仍以Tier區分，避免單一抽屜/單一實體位置被攻破時兩個Tier的MFA裝置一次曝險）。
 
 **技術評估（各層防護逐一比對常見攻擊手法）**：
 
@@ -858,17 +865,41 @@ Server之間的東西向存取，由防火牆（含各Server自身的本機防�
 | SIM Swapping | 無效 | TOTP驗證碼由手機本地運算產生，不經電信商網路傳輸，與門號無關 |
 | MFA疲勞攻擊（Push轟炸） | 無效 | TOTP需管理員主動開啟App、手動抄錄數字輸入，非可被動轟炸同意的推播機制 |
 | 手機遺失/被盜導致金鑰外洩 | 風險大幅降低 | 手機平時鎖於抽屜，不隨員工個人攜帶外出，實體保管流程比照PAW等級的門禁邏輯 |
-| 雲端同步導致金鑰外洩（Google Authenticator近年新增功能） | 無效 | 手機Air-gapped，物理上無網路能力做任何雲端同步，此為裝置生命週期第一天即成立的物理性防護，優於「僅靠設定關閉同步」（設定屬軟體層防護，可能被誤開啟或被App更新改變預設值） |
+| 雲端同步導致金鑰外洩（部分TOTP App近年新增的雲端備份/同步功能） | 無效 | 手機Air-gapped，物理上無網路能力做任何雲端同步，此為裝置生命週期第一天即成立的物理性防護，優於「僅靠設定關閉同步」（設定屬軟體層防護，可能被誤開啟或被App更新改變預設值） |
+| 單一Tier的MFA裝置或抽屜被突破，波及另一Tier | 已透過雙裝置/雙位置設計排除 | 兩支手機、（建議）兩個實體存放位置各自獨立，突破其中一組不會連帶取得另一Tier的MFA能力 |
 
-**結論**：此機制實質具備與硬體安全金鑰（如FIDO2/YubiKey）相近的防護等級——金鑰本質上只存在於一支從未連網的實體裝置中，需要真正的實體接觸才能取得。攻破此MFA需同時做到：取得帳密（社交工程/釣魚可達成）+ 實體侵入機房 + 打開上鎖抽屜 + 取得該手機，已超出純網路攻擊手段能達成的範圍，需具備實體滲透能力的高階威脅行為者方能做到。**「此MFA被攻破，大致等同於遭遇具實體滲透能力的高階威脅行為者（如國家級APT）」此一威脅模型判斷，於此設計下可視為合理成立**，並非自我安慰式的假設，而是有具體技術依據的評估。
+**結論**：此機制實質具備與硬體安全金鑰（如FIDO2/YubiKey）相近的防護等級——金鑰本質上只存在於一支從未連網的實體裝置中，需要真正的實體接觸才能取得。攻破任一Tier的MFA需同時做到：取得該Tier帳密（社交工程/釣魚可達成）+ 實體侵入機房 + 打開上鎖抽屜 + 取得對應的手機，已超出純網路攻擊手段能達成的範圍，需具備實體滲透能力的高階威脅行為者方能做到。**「此MFA被攻破，大致等同於遭遇具實體滲透能力的高階威脅行為者（如國家級APT）」此一威脅模型判斷，於此設計下可視為合理成立**，並非自我安慰式的假設，而是有具體技術依據的評估。
 
 **待確認/待落實的流程面細節（不影響整體判斷，屬周邊強化）**：
-- 手機本身應設定螢幕鎖定（密碼/生物辨識），避免抽屜遭開啟後手機可直接被使用
+- 兩支手機本身皆應設定螢幕鎖定（密碼/生物辨識），避免抽屜遭開啟後手機可直接被使用
 - 抽屜鑰匙/密碼的管理鏈，應與機房門禁管理維持同等嚴謹程度，避免此環節成為整條防線中相對薄弱的一環
+- 建議兩支手機實體存放於不同的抽屜/保管位置，避免「同一個抽屜同時裝了兩個Tier的鑰匙」而讓雙裝置設計的隔離價值打折扣
 
-### 11.9 整體架構小結
+### 11.9 Apache Guacamole堡壘機：Tier 0與Tier 1各自獨立一架
 
-本套PAM架構，以Machine+User雙重驗證（802.1X/EAP-TLS）、PAW VM隔離（PCI Passthrough繞開Hypervisor共享風險）、實體PAW打破循環依賴、特權帳號綁定PAW（取代動態JIT/JEA）、Air-gapped TOTP（取代硬體金鑰）等一系列**用相對簡單、可視化程度高的機制組合**，在有限人力與預算下，達到與商用PAM方案相近的實質防護效果。其核心設計哲學是：不追求每一層都達到理論最強，而是透過多層組合，將攻擊者的實際攻擊成本拉高至超出現實威脅模型（一般犯罪集團、機會主義攻擊者）能負擔的範圍，並誠實承認其邊界所在（國家級/高階持續性威脅超出本架構防護能力，此為預算與威脅模型下的合理取捨，而非設計疏漏）。
+**決策**：Tier 0與Tier 1不共用同一架Guacamole堡壘機，改為**兩架完全獨立的Guacamole**，各自對應到11.4節規劃的Tier 0/Tier 1 PAW VM Host。
+
+**背景**：原規劃為單一堡壘機，帳號權限層面已做到「一個帳號僅能存取Tier 0或Tier 1其中之一，不會同時持有兩者權限」，符合實務上人員工作劃分的現況。但即使帳號權限劃分乾淨，**單一堡壘機架構下，Guacamole這套軟體本身、其資料庫、Session管理與錄影檔存放，是兩個Tier共用的同一份**，形成三個原本可以避免的共同風險：
+1. Guacamole本身若有未修補漏洞，攻擊者取得該主機作業系統權限後，兩個Tier的連線通道會同時落入攻擊者手中，不需額外橫向移動
+2. 資料庫與Session錄影檔若遭存取，兩個Tier的操作紀錄會被同一批人看光，即使帳號權限沒有越界，資料機密性的邊界已被打破
+3. 驗證MFA的伺服器端邏輯是同一套程式碼在跑，此程式碼的安全性變成兩個Tier共同的單點故障
+
+**決策理由（拆分後的實際增量）**：
+- 攻陷其中一架Guacamole，不會連帶暴露另一個Tier——兩者是物理上/邏輯上完全獨立的兩套系統，不存在共用元件可跨越
+- Patch/維護視窗可分開規劃且風險分散：Tier 0這架可採最高規格的維護嚴謹度，不受Tier 1維護節奏牽制
+- 稽核紀錄與Session錄影檔物理上分開存放，不需仰賴應用層邏輯區分歸屬，降低存取控制邏輯寫錯導致跨Tier資料外洩的風險
+- 呼應本架構已在PAW/特權帳號層採用的「空間隔離取代動態授權」設計哲學——此決策是將同樣的哲學延伸至「通往PAW的門」本身，形成一條從頭到尾都不交會的兩條平行路徑，而非兩條路徑走到一半匯集於同一閘口才分岔
+
+**網路與存取管制**：
+- Tier 0 Guacamole、Tier 1 Guacamole建議各自獨立VLAN（或至少獨立主機，視現有VLAN25 Guacamole網段規劃決定是否需要拆分VLAN，或維持同VLAN但強化主機層防火牆規則）
+- 僅IT VLAN 60可存取兩架Guacamole（防火牆管制）
+- Tier 0 Guacamole僅可連線至Tier 0 PAW VM Host所在VLAN 20；Tier 1 Guacamole僅可連線至Tier 1 PAW VM Host所在VLAN 21，兩者不交叉
+
+**已知的維運代價（可接受，理由見決策）**：多一套系統需要維護、Patch、備份；MFA裝置本來就需要依Tier分開管理（見11.8節），不因堡壘機數量增加而產生額外負擔。
+
+### 11.10 整體架構小結
+
+本套PAM架構，以Machine+User雙重驗證（一般裝置802.1X/EAP-TLS）、PAW VM靜態VLAN隔離（VLAN 20/21，取代原規劃的PCI Passthrough動態802.1X指派）、緊急實體PAW（角色已由「打破RADIUS循環依賴」轉為「Guacamole/VM Host故障備援」）、特權帳號綁定PAW（取代動態JIT/JEA）、Tier 0/Tier 1各自獨立的Guacamole堡壘機、Air-gapped TOTP（取代硬體金鑰，且依Tier各自獨立）等一系列**用相對簡單、可視化程度高的機制組合**，在有限人力與預算下，達到與商用PAM方案相近的實質防護效果。其核心設計哲學是：不追求每一層都達到理論最強，而是透過多層組合（尤其是貫穿全架構的「空間隔離取代動態授權/驗證」這條主軸），將攻擊者的實際攻擊成本拉高至超出現實威脅模型（一般犯罪集團、機會主義攻擊者）能負擔的範圍，並誠實承認其邊界所在（國家級/高階持續性威脅超出本架構防護能力，此為預算與威脅模型下的合理取捨，而非設計疏漏）。
 
 ---
 - 建議將「每日巡檢」項目未來納入自動化腳本（如Python + Netmiko/Paramiko定期抓取並比對），減少人工執行負擔並能更早發現異常趨勢。
