@@ -8,8 +8,12 @@ vlan 10
  name T0
 vlan 20
  name T0PAW
+ vlan 21
+ name T1PAW
 vlan 25
  name T0BZ
+vlan 26
+ name T1BZ
 vlan 30
  name T1
 vlan 34
@@ -148,7 +152,7 @@ spanning-tree mode rapid-pvst
 ! 明確指定 Core Switch 為 STP Root
 ! 不使用 root primary 巨集，以避免依現有 STP 拓撲動態計算 priority
 ! Production 環境應明確規劃 Root / Secondary Root 的 priority
-spanning-tree vlan 10,20,25,30,34,35,37,38,40,50,60,70-75,80,90,98 priority 4096
+spanning-tree vlan 10,20,21,25,26,30,34,35,37,38,40,50,60,70-75,80,90,98 priority 4096
 spanning-tree loopguard default
 
 ! ============================
@@ -271,7 +275,7 @@ interface GigabitEthernet0/0
  description Upstream Trunk to Firewall (Router-on-a-Stick / DHCP)
  switchport trunk encapsulation dot1q
  switchport trunk native vlan 999
- switchport trunk allowed vlan 10,20,25,30,34,35,37,38,40,50,60,70-75,80,90,98
+ switchport trunk allowed vlan 10,20,21,25,26,30,34,35,37,38,40,50,60,70-75,80,90,98
  switchport mode trunk
  ip dhcp snooping trust
  ip arp inspection trust
@@ -285,7 +289,7 @@ interface GigabitEthernet0/1
  switchport trunk encapsulation dot1q
  ! Production 環境應設為 999, 實體機/VM之NIC/vNIC需指定VLAN ID；Lab 環境 (VMware Workstation) 依需求設為 10
  switchport trunk native vlan 10
- switchport trunk allowed vlan 10,20,25,30
+ switchport trunk allowed vlan 10,20,21,25,26,30
  switchport mode trunk
  spanning-tree portfast trunk
  ! 由虛擬化網路管理MAC Address, IP Address & ARP降低維運負擔
@@ -317,7 +321,7 @@ interface GigabitEthernet3/2
  description Downlink Trunk to Core Switch Extension (SW-HQ-Core-3)
  switchport trunk encapsulation dot1q
  switchport trunk native vlan 999
- switchport trunk allowed vlan 10,20,25,30,34,35,37,38,40,50,60,70-75,80,90,98
+ switchport trunk allowed vlan 10,20,21,25,26,30,34,35,37,38,40,50,60,70-75,80,90,98
  switchport mode trunk
  ip dhcp snooping trust
  ip arp inspection trust
