@@ -14,7 +14,9 @@ if (-not (Get-ADOrganizationalUnit -Filter "DistinguishedName -eq '$TargetOU'" -
 # 2. 定義 HQ 專用 802.1x 群組清單
 $HQGroups = @(
     @{ Name = "SG-HQ-8021X-VLAN20-T0PAW-Users";     Description = "HQ Tier 0 PAW User Auth Group (VLAN 20)" },
+    @{ Name = "SG-HQ-8021X-VLAN21-T0PAW-Users";     Description = "HQ Tier 1 PAW User Auth Group (VLAN 21)" },
     @{ Name = "SG-HQ-8021X-VLAN25-T0BZ-Devices";    Description = "HQ Tier 0 Bastion MAB Group (VLAN 25)" },
+    @{ Name = "SG-HQ-8021X-VLAN26-T0BZ-Devices";    Description = "HQ Tier 1 Bastion MAB Group (VLAN 26)" },
     @{ Name = "SG-HQ-8021X-VLAN35-Printers";        Description = "HQ Printers MAB Group (VLAN 35)" },
     @{ Name = "SG-HQ-8021X-VLAN37-IoT-Devices";     Description = "HQ IoT Devices MAB Group (VLAN 37)" },
     @{ Name = "SG-HQ-8021X-VLAN38-IPPhones";        Description = "HQ IP Phones MAB Group (VLAN 38)" },
