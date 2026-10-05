@@ -17,7 +17,7 @@ echo  開始安裝 GLPI Agent...
 echo =========================================================
 
 :: 2. 設定參數與變數
-set "SERVER_URL=http://glpi.foo.bar.tw:8080/front/inventory.php"
+set "SERVER_URL=http://glpi.corp.foo.bar.tw:8080/front/inventory.php"
 set "INSTALL_DIR=C:\Program Files\GLPI-Agent"
 
 :: 自動搜尋當前目錄下的 GLPI-Agent MSI 安裝檔
