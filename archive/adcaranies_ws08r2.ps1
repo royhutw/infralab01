@@ -315,7 +315,9 @@ function ReadConfiguration {
 ####                 Populate Configuration Functions                       ####
 ################################################################################
 function DefaultCanaries {
-    param($Doc, $Parent, $ParentOU)
+    # $ParentOU : canary container DN (CN=...), used for most canaries
+    # $RealOU   : real OU / domain DN; an organizationalUnit cannot be created under a container
+    param($Doc, $Parent, $ParentOU, $RealOU)
 
     $Defaults = @(
         @("CanaryUser",     "user",                   "Default Canary user"),
@@ -326,8 +328,10 @@ function DefaultCanaries {
         @("CanaryTemplate", "pKICertificateTemplate", "Default Canary certificate template")
     )
     foreach($Def in $Defaults){
+        $EntryPath = $ParentOU
+        if($Def[1] -eq "organizationalUnit"){ $EntryPath = $RealOU }
         AddEntryElement -Doc $Doc -Parent $Parent -ElementName "Canary" `
-                        -EntryName $Def[0] -EntryType $Def[1] -EntryPath $ParentOU `
+                        -EntryName $Def[0] -EntryType $Def[1] -EntryPath $EntryPath `
                         -Description ("[ADCanaries] " + $Def[2] + " -- change it")
     }
 }
@@ -371,7 +375,7 @@ function PopulateConf {
 
   $CanariesNode = $Doc.CreateElement("Canaries")
   [void]$Root.AppendChild($CanariesNode)
-  DefaultCanaries -Doc $Doc -Parent $CanariesNode -ParentOU $CanariesPath
+  DefaultCanaries -Doc $Doc -Parent $CanariesNode -ParentOU $CanariesPath -RealOU $ParentOU
 
   #### Overwrite output file
   $FullPath = ResolveFullPath $Config
@@ -429,8 +433,18 @@ function CreateCanary {
     Write-Host "[-] Canary already existed : $DistinguishedName"
   }
   else {
-    New-ADObject -Name $Canary.Name -Path $Canary.Path -Type $Canary.Type
-    $CanaryObject = (Get-ADObject $DistinguishedName -Properties *)
+    try{
+      New-ADObject -Name $Canary.Name -Path $Canary.Path -Type $Canary.Type -ErrorAction Stop
+      $CanaryObject = (Get-ADObject $DistinguishedName -Properties * -ErrorAction Stop)
+    }catch{
+      Write-Host "[!] Failed to create canary (skipped) : $DistinguishedName"
+      Write-Host "    $_"
+      if($Canary.Type -eq "organizationalUnit"){
+        Write-Host "    Hint : an organizationalUnit can only be created under an OU or the domain root,"
+        Write-Host "           not under a container. Set this canary's <Path> to a real OU (e.g. your ParentOU)."
+      }
+      return
+    }
 
     # Add users / computer / group Canary to CanaryGroup and set primary group
     if ($Canary.Type -eq "user"){
@@ -445,8 +459,11 @@ function CreateCanary {
         Add-ADGroupMember -Identity $CanaryGroupDN -Members $DistinguishedName
     }
 
+    # Note : in PowerShell 2.0, foreach over $null still runs once, so guard each item
     foreach($G in $CanaryObject.MemberOf){
-        Remove-ADGroupMember -Identity $G -Members $DistinguishedName -Confirm:$false
+        if($G){
+            Remove-ADGroupMember -Identity $G -Members $DistinguishedName -Confirm:$false
+        }
     }
     Write-Host "[*] Canary created : $DistinguishedName"
     SetAuditSACL -DistinguishedName $DistinguishedName
