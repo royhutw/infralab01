@@ -71,6 +71,13 @@ function DisplayCanaryBanner {
 ####                             MISC Functions                             ####
 ################################################################################
 
+function GetEntryDN {
+  # An organizationalUnit has an "OU=" RDN, every other class here uses "CN="
+  param($Entry)
+  if($Entry.Type -eq "organizationalUnit"){ return "OU=" + $Entry.Name + "," + $Entry.Path }
+  return "CN=" + $Entry.Name + "," + $Entry.Path
+}
+
 function ADObjectExists {
   param($Path)
   try{
@@ -427,7 +434,7 @@ function CreateCanary {
 
   $CanaryGroupDN = $CanaryGroup.distinguishedName
   $CanaryGroupToken = (Get-ADGroup $CanaryGroupDN -Properties @("primaryGroupToken")).primaryGroupToken
-  $DistinguishedName = "CN=" + $Canary.Name + "," + $Canary.Path
+  $DistinguishedName = GetEntryDN $Canary
 
   if (ADObjectExists -Path $DistinguishedName){
     Write-Host "[-] Canary already existed : $DistinguishedName"
@@ -597,7 +604,7 @@ function DestroyCanaries {
   #### Destroy Canaries
   foreach ($Canary in $Canaries) {
     Write-Host ""
-    $DistinguishedName = "CN=" + $Canary.Name + "," + $Canary.Path
+    $DistinguishedName = GetEntryDN $Canary
     DestroyCanary -DistinguishedName $DistinguishedName
   }
   # Delete Primary Group for Canaries
