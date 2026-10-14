@@ -280,15 +280,15 @@ AI 為輔助工具，而非最終決策者。
 
 ### 實驗測試環境
 
-防火牆: pfsense Community Edition
-虛擬化平台: PROXMOX VE 9.2
-Windows Server 2022
-Debian Linux 13
-Windows 11 Pro
-Core switch: Cisco Catalyst WS-C2960X-24TS-L
-Edge switch: Cisco Catalyst WS-C2960X-24TS-L
-SIP話機: FANVIL SIP IP Phone
-WiFi AP: HPE Aruba AP-305 (刷成胖AP)
+- 防火牆: pfsense Community Edition
+- 虛擬化平台: PROXMOX VE 9.2
+- Windows Server 2022
+- Debian Linux 13
+- Windows 11 Pro
+- Core switch: Cisco Catalyst WS-C2960X-24TS-L
+- Edge switch: Cisco Catalyst WS-C2960X-24TS-L
+- SIP話機: FANVIL SIP IP Phone
+- WiFi AP: HPE Aruba AP-305 (刷成胖AP)
 
 ---
 
