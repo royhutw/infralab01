@@ -1,10 +1,6 @@
 # InfraLab01
 
 ---
-![License](https://img.shields.io/se-Apache%202.0-green
-![PowerShell](https://img.shields.io/badge/PowerShell-5.1r](https://img.shields.io/badge/Docker-Compose-ctive Directory](https://img.shields.io/badge/Microsoft-078D4
-![PKI](https://img.shields.io/badge/PKI-ADCS%20%7C%SL-orange
-![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20rey
 
 > Infrastructure as Code for Real-World SMEs
 >
