@@ -170,4 +170,32 @@
         TriggerTime     = '02:00'
         RunAsUser       = 'SYSTEM'
     }
+
+    # ── 08 & 09 CEP/CES 獨立伺服器部署專用 ────────────────────
+    CepCes = @{
+        # ── AD 組織單位 (OU) 與 GPO 名稱 ──────────────────────
+        OUName                 = 'CEP-CES-Servers'
+        OUDescription          = 'Tier 0 AD CS CEP/CES 憑證註冊 Web 服務專用伺服器 OU'
+        GPOName                = 'PKI - CEP-CES Server Auto-Enrollment'
+
+        # ── 專屬安全群組與主機清單（用於範本最小權限與委派設定）
+        GroupName              = 'CEP-CES-Servers-Group'
+        # 請填入這台獨立 CEP/CES 主機的 AD 電腦名稱（不含網域尾碼與 $）
+        ServerComputerNames    = @('CEPCES1')
+        # 請填入後端 Sub CA 主機的 AD 電腦名稱（供設定 Kerberos 限制委派指向此主機）
+        SubCAComputerName      = 'SUBCA1'
+
+        # ── 獨立 CEP/CES 主機對外服務的 FQDN（需與主機 DNS 名稱一致）
+        ServerFQDN             = 'cepces1.corp.foo.bar.tw'
+        CertStore              = 'Cert:\LocalMachine\My'
+
+        # ── CEP-CES 專用 Web 伺服器憑證範本設定 ──────────────
+        SourceTemplate         = 'WebServer'
+        WebTemplateName        = 'CEP-CES-WebServer'
+        WebTemplateDisplay     = 'CEP-CES Web Server Certificate'
+        KeyLength              = 4096
+        # 有效期 2 年 (730 天)，更新期 75% (547.5 天)，小端序 FILETIME 負值 Ticks
+        ValidityTicks          = -630720000000000
+        RenewalTicks           = -473040000000000
+    }
 }
