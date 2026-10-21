@@ -133,7 +133,7 @@ try {
     $SubCAFQDN = $SubCAObj.dNSHostName
 
     # 組合需要委派的 SPN 清單（同時涵蓋 NetBIOS 名稱與 FQDN 的 HOST 及 rpcss 服務）
-    $AllowedSPNs = @(
+    $AllowedSPNs = [string[]]@(
         "HOST/$SubCAName",
         "HOST/$SubCAFQDN",
         "rpcss/$SubCAName",
@@ -141,20 +141,25 @@ try {
     )
 
     foreach ($CompName in $Params.ServerComputerNames) {
-        # 設定 msDS-AllowedToDelegateTo 屬性，並開啟 TRUSTED_TO_AUTH_FOR_DELEGATION (Protocol Transition)
-        Set-ADComputer -Identity $CompName `
-                       -Add @{'msDS-AllowedToDelegateTo' = $AllowedSPNs} `
-                       -TrustedForDelegation $false `
-                       -TrustedToAuthForDelegation $true `
-                       -ErrorAction SilentlyContinue
+        # 1. 關閉不安全的「非限制委派 (Unconstrained Delegation)」與「通訊協定轉換 (Protocol Transition)」
+        #    因為 CEP/CES 採用純 Kerberos 驗證，僅需「純 Kerberos 限制委派 (Kerberos Only)」最為安全
+        Set-ADAccountControl -Identity "$CompName$" `
+                             -TrustedForDelegation $false `
+                             -TrustedToAuthForDelegation $false `
+                             -ErrorAction Stop
 
-        # 確保屬性精準覆寫（冪等）
+        # 2. 寫入 msDS-AllowedToDelegateTo 屬性（使用 -Replace 確保完整覆寫且具備冪等性）
         Set-ADComputer -Identity $CompName `
                        -Replace @{'msDS-AllowedToDelegateTo' = $AllowedSPNs} `
-                       -TrustedToAuthForDelegation $true `
                        -ErrorAction Stop
 
-        Write-Host "      [OK] 已完成 $CompName ->$SubCAFQDN (HOST, rpcss) 的 Kerberos 限制委派" -ForegroundColor Green
+        # 3. 重新讀取驗證是否寫入成功
+        $VerifyComp = Get-ADComputer -Identity$CompName -Properties 'msDS-AllowedToDelegateTo' -ErrorAction Stop
+        if ($VerifyComp.'msDS-AllowedToDelegateTo'.Count -ge 4) {
+            Write-Host "      [OK] 已完成 $CompName ->$SubCAFQDN (HOST, rpcss) 的純 Kerberos 限制委派" -ForegroundColor Green
+        } else {
+            throw "msDS-AllowedToDelegateTo 屬性寫入後驗證數量不符！"
+        }
     }
 }
 catch {
