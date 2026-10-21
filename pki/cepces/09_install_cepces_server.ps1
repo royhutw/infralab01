@@ -171,10 +171,12 @@ try {
         Write-Host "  正在初始化 CEP (憑證註冊原則 Web 服務)..." -ForegroundColor Gray
         $CepParams = @{
             AuthenticationType = 'Kerberos'
+            SSLCertThumbprint  = $Cert.Thumbprint
+            KeyBasedRenewal    = $false
             Force              = $true
             ErrorAction        = 'Stop'
         }
-        Install-AdcsEnrollmentPolicyWebSvc @CepParams | Out-Null
+        Install-AdcsEnrollmentPolicyWebService @CepParams | Out-Null
         Write-Host "  [OK] CEP 服務初始化完成。" -ForegroundColor Green
     } else {
         Write-Host "  [SKIP] CEP 服務已存在，略過初始化。" -ForegroundColor DarkGray
@@ -184,14 +186,14 @@ try {
     if (-not (Test-Path ($CesPath))) {
         Write-Host "  正在初始化 CES (憑證註冊 Web 服務，連結至 $CAConfigStr)..." -ForegroundColor Gray
         $CesParams = @{
-            CAConfig              = $CAConfigStr
-            AuthenticationType    = 'Kerberos'
-            RenewalOnly           = $false
-            AllowKeyBasedRenewal  = $false
-            Force                 = $true
-            ErrorAction           = 'Stop'
+            CAConfig           = $CAConfigStr
+            AuthenticationType = 'Kerberos'
+            SSLCertThumbprint  = $Cert.Thumbprint
+            RenewalOnly        = $false
+            Force              = $true
+            ErrorAction        = 'Stop'
         }
-        Install-AdcsEnrollmentWebSvc @CesParams | Out-Null
+        Install-AdcsEnrollmentWebService @CesParams | Out-Null
         Write-Host "  [OK] CES 服務初始化完成。" -ForegroundColor Green
     } else {
         Write-Host "  [SKIP] CES 服務已存在，略過初始化。" -ForegroundColor DarkGray
