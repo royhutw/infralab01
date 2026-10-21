@@ -141,20 +141,17 @@ try {
     )
 
     foreach ($CompName in $Params.ServerComputerNames) {
-        # 1. 關閉不安全的「非限制委派 (Unconstrained Delegation)」與「通訊協定轉換 (Protocol Transition)」
-        #    因為 CEP/CES 採用純 Kerberos 驗證，僅需「純 Kerberos 限制委派 (Kerberos Only)」最為安全
-        Set-ADAccountControl -Identity "$CompName$" `
-                             -TrustedForDelegation $false `
-                             -TrustedToAuthForDelegation $false `
-                             -ErrorAction Stop
+        # 1. 先取得目標電腦物件（避免字串與 $ 符號拼接問題）
+        $CompObj = Get-ADComputer -Identity $CompName -ErrorAction Stop
 
-        # 2. 寫入 msDS-AllowedToDelegateTo 屬性（使用 -Replace 確保完整覆寫且具備冪等性）
-        Set-ADComputer -Identity $CompName `
+        # 2. 直接透過 Set-ADComputer 關閉非限制委派，並寫入 msDS-AllowedToDelegateTo 限制委派清單
+        Set-ADComputer -Identity $CompObj `
+                       -TrustedForDelegation $false `
                        -Replace @{'msDS-AllowedToDelegateTo' = $AllowedSPNs} `
                        -ErrorAction Stop
 
         # 3. 重新讀取驗證是否寫入成功
-        $VerifyComp = Get-ADComputer -Identity$CompName -Properties 'msDS-AllowedToDelegateTo' -ErrorAction Stop
+        $VerifyComp = Get-ADComputer -Identity$CompObj -Properties 'msDS-AllowedToDelegateTo' -ErrorAction Stop
         if ($VerifyComp.'msDS-AllowedToDelegateTo'.Count -ge 4) {
             Write-Host "      [OK] 已完成 $CompName ->$SubCAFQDN (HOST, rpcss) 的純 Kerberos 限制委派" -ForegroundColor Green
         } else {
