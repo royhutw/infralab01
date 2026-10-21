@@ -58,7 +58,7 @@ $Features = @(
     'Web-Windows-Auth',
     'Web-Asp-Net45',
     'ADCS-Enroll-Web-Svc',
-    'ADCS-Policy-Web-Svc'
+    'ADCS-Enroll-Web-Pol'
 )
 
 # 使用 ($Features) 括號隔離，防止剪貼簿吃掉 in 後方的空白
