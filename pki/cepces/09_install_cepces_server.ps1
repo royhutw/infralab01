@@ -161,7 +161,7 @@ Write-Host ""
 Write-Host "[4/5] 檢查並初始化 CEP 與 CES Web 服務..." -ForegroundColor Yellow
 
 try {
-    Import-Module AdcsAdministration -ErrorAction Stop
+    Import-Module AdcsDeployment -ErrorAction Stop
 
     $SubCAFQDN   = "$($Params.SubCAComputerName).$($Params.DomainName)"
     $CAConfigStr = "$SubCAFQDN\$($Params.CACommonName)"
