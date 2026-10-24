@@ -3,9 +3,9 @@
 #  於 Enterprise Sub CA 伺服器上執行（需具備 Domain/Enterprise Admin 權限）
 # ============================================================
 
-#region ── 參數區（統一從 CAConfig.psd1 讀取）──────────────────
+#region ── 參數區（統一從 CAConfig.psd1 讀取：Global、Templates、CepCes）──
 . (Join-Path $PSScriptRoot 'Import-CAConfig.ps1')
-$Params = Merge-CAConfig -Sections 'Global','CepCes'
+$Params = Merge-CAConfig -Sections 'Global','Templates','CepCes'
 
 $Params.ValidityTicks = [long]$Params.ValidityTicks
 $Params.RenewalTicks  = [long]$Params.RenewalTicks
@@ -81,11 +81,12 @@ foreach ($CompName in $Params.ServerComputerNames) {
 }
 
 # ════════════════════════════════════════════════════════════
-#  [2/6] 建立專屬安全群組並加入 CEP/CES 電腦帳號
+#  [2/6] 建立專屬安全群組並加入 CEP/CES 及 NPS/RADIUS 電腦帳號
 # ════════════════════════════════════════════════════════════
 Write-Host ""
-Write-Host "[2/6] 檢查並建立專屬安全群組 ($($Params.GroupName))..." -ForegroundColor Yellow
+Write-Host "[2/6] 檢查並建立安全群組 ($($Params.GroupName) 與 $($Params.NPSServersGroupName))..." -ForegroundColor Yellow
 
+# 1. 處理 CEP-CES-Servers-Group 群組
 $ExistingGroup = Get-ADGroup -Filter "Name -eq '$($Params.GroupName)'" -ErrorAction SilentlyContinue
 if ($null -eq $ExistingGroup) {
     $GrpParams = @{
@@ -111,7 +112,44 @@ foreach ($CompName in $Params.ServerComputerNames) {
         Add-ADGroupMember -Identity $Params.GroupName -Members $CompObj -ErrorAction Stop
         Write-Host "      [OK] 已將 $CompName 加入群組 $($Params.GroupName)" -ForegroundColor Green
     } else {
-        Write-Host "      [SKIP] $CompName 已是群組成員" -ForegroundColor DarkGray
+        Write-Host "      [SKIP] $CompName 已是群組 $($Params.GroupName) 成員" -ForegroundColor DarkGray
+    }
+}
+
+# 2. 同步檢查並將 NPSServerComputerNames (如 RADIUS1, RADIUS3) 加入 NPS-Servers 群組
+if (-not [string]::IsNullOrWhiteSpace($Params.NPSServersGroupName)) {
+    $ExistingNPSGroup = Get-ADGroup -Filter "Name -eq '$($Params.NPSServersGroupName)'" -ErrorAction SilentlyContinue
+    if ($null -eq $ExistingNPSGroup) {
+        $NPSGrpParams = @{
+            Name           = $Params.NPSServersGroupName
+            SamAccountName = $Params.NPSServersGroupName
+            GroupCategory  = 'Security'
+            GroupScope     = 'Global'
+            Path           = "CN=Users,$($Params.DomainDN)"
+            Description    = 'NPS 與 RADIUS 伺服器電腦帳號群組 - 授權申請 EAP-TLS-NPS-Server 憑證'
+            ErrorAction    = 'Stop'
+        }
+        New-ADGroup @NPSGrpParams
+        Write-Host "      [OK] 群組已建立：$($Params.NPSServersGroupName)" -ForegroundColor Green
+    } else {
+        Write-Host "      [SKIP] 群組已存在：$($Params.NPSServersGroupName)" -ForegroundColor DarkGray
+    }
+
+    foreach ($NPSCompName in $Params.NPSServerComputerNames) {
+        try {
+            $NPSCompObj = Get-ADComputer -Identity $NPSCompName -ErrorAction Stop
+            $IsNPSMember = Get-ADGroupMember -Identity $Params.NPSServersGroupName -ErrorAction SilentlyContinue |
+                               Where-Object { $_.SamAccountName -eq $NPSCompObj.SamAccountName }
+            if ($null -eq $IsNPSMember) {
+                Add-ADGroupMember -Identity $Params.NPSServersGroupName -Members $NPSCompObj -ErrorAction Stop
+                Write-Host "      [OK] 已將 $NPSCompName 加入群組 $($Params.NPSServersGroupName)" -ForegroundColor Green
+            } else {
+                Write-Host "      [SKIP] $NPSCompName 已是群組 $($Params.NPSServersGroupName) 成員" -ForegroundColor DarkGray
+            }
+        }
+        catch {
+            Write-Host "      [WARNING] 找不到電腦帳號 $NPSCompName，略過加入群組：$($_.Exception.Message)" -ForegroundColor Yellow
+        }
     }
 }
 
@@ -228,6 +266,7 @@ if ($null -ne $ExistingTemplate) {
 Write-Host ""
 Write-Host "[5/6] 設定範本 Hardened ACL 並發布至 CA..." -ForegroundColor Yellow
 
+# 1. 處理 CEP-CES 專屬網頁伺服器範本 ($Params.WebTemplateName)
 dsacls "$ExistingTemplateDN" /P:Y 2>&1 | Out-Null
 dsacls "$ExistingTemplateDN" /R "NT AUTHORITY\SYSTEM" 2>&1 | Out-Null
 dsacls "$ExistingTemplateDN" /R "NT AUTHORITY\Authenticated Users" 2>&1 | Out-Null
@@ -241,10 +280,45 @@ dsacls "$ExistingTemplateDN" /G "$($Params.NetBIOSDomainName)\$($Params.GroupNam
 dsacls "$ExistingTemplateDN" /G "$($Params.NetBIOSDomainName)\$($Params.GroupName):CA;Enroll" 2>&1 | Out-Null
 dsacls "$ExistingTemplateDN" /G "$($Params.NetBIOSDomainName)\$($Params.GroupName):CA;AutoEnrollment" 2>&1 | Out-Null
 
-Write-Host "      [OK] 已透過 dsacls 停用繼承並僅授權 $($Params.GroupName) 自動註冊" -ForegroundColor Green
+Write-Host "      [OK] 已透過 dsacls 停用繼承並僅授權 $($Params.GroupName) 自動註冊 $($Params.WebTemplateName)" -ForegroundColor Green
 
 certutil -config $CAConfig -setcatemplates "+$($Params.WebTemplateName)" | Out-Null
 Write-Host "      [OK] 已將範本 $($Params.WebTemplateName) 發布至 CA" -ForegroundColor Green
+
+# 2. 處理 NPS / RADIUS 伺服器憑證範本 ($Params.NPSTemplateName) ACL 授權
+#    同時授權 NPSServersGroupName 群組與個別電腦帳號 (SamAccountName 含 $)，
+#    避免 Linux 主機剛加入群組時因 Kerberos 票證 PAC 尚未更新而遭 CA 拒絕 (0x80094012)。
+$NPSTemplateDN  = "CN=$($Params.NPSTemplateName),$TemplateBaseDN"
+$NPSTemplateObj = Get-ADObject -Filter "distinguishedName -eq '$NPSTemplateDN'" -SearchBase $TemplateBaseDN -ErrorAction SilentlyContinue
+
+if ($null -ne $NPSTemplateObj) {
+    if (-not [string]::IsNullOrWhiteSpace($Params.NPSServersGroupName)) {
+        dsacls "$NPSTemplateDN" /G "$($Params.NetBIOSDomainName)\$($Params.NPSServersGroupName):GR" 2>&1 | Out-Null
+        dsacls "$NPSTemplateDN" /G "$($Params.NetBIOSDomainName)\$($Params.NPSServersGroupName):CA;Enroll" 2>&1 | Out-Null
+        dsacls "$NPSTemplateDN" /G "$($Params.NetBIOSDomainName)\$($Params.NPSServersGroupName):CA;AutoEnrollment" 2>&1 | Out-Null
+        Write-Host "      [OK] 已確保群組 $($Params.NetBIOSDomainName)\$($Params.NPSServersGroupName) 具備 $($Params.NPSTemplateName) 註冊權限" -ForegroundColor Green
+    }
+
+    foreach ($NPSCompName in $Params.NPSServerComputerNames) {
+        try {
+            $NPSCompObj = Get-ADComputer -Identity $NPSCompName -ErrorAction Stop
+            $NPSSamName = $NPSCompObj.SamAccountName  # 自動帶有結尾 $ 號 (例如 RADIUS3$)
+
+            dsacls "$NPSTemplateDN" /G "$($Params.NetBIOSDomainName)\${NPSSamName}:GR" 2>&1 | Out-Null
+            dsacls "$NPSTemplateDN" /G "$($Params.NetBIOSDomainName)\${NPSSamName}:CA;Enroll" 2>&1 | Out-Null
+            dsacls "$NPSTemplateDN" /G "$($Params.NetBIOSDomainName)\${NPSSamName}:CA;AutoEnrollment" 2>&1 | Out-Null
+            Write-Host "      [OK] 已直接賦予電腦帳號 $($Params.NetBIOSDomainName)\$NPSSamName 對 $($Params.NPSTemplateName) 的讀取與註冊權限" -ForegroundColor Green
+        }
+        catch {
+            Write-Host "      [WARNING] 找不到電腦帳號 $NPSCompName，略過個別授權：$($_.Exception.Message)" -ForegroundColor Yellow
+        }
+    }
+
+    certutil -config $CAConfig -setcatemplates "+$($Params.NPSTemplateName)" | Out-Null
+    Write-Host "      [OK] 已確認範本 $($Params.NPSTemplateName) 發布至 CA" -ForegroundColor Green
+} else {
+    Write-Host "      [WARNING] 找不到憑證範本 $($Params.NPSTemplateName)，請確認是否已先執行 04_create_templates.ps1。" -ForegroundColor Yellow
+}
 
 # ════════════════════════════════════════════════════════════
 #  [6/6] 建立並連結 Auto-Enrollment GPO 至 CEP-CES-Servers OU

@@ -89,7 +89,7 @@
         ValidityPeriod      = 'Years'
     }
 
-    # ── 04_create_templates.ps1 專用 ─────────────────────────
+    # ── 04_create_templates.ps1 & 08_prepare_cepces_ad_and_template.ps1 共用 ─
     Templates = @{
         # ── 來源範本名稱（內建範本，複製基礎用）────────────
         SourceComputer = 'Machine'
@@ -106,11 +106,11 @@
 
         KeyLength = 4096
 
-        # ── NPS 伺服器專屬安全群組（用於最小權限控管）────────
-        # 請將實際 NPS 伺服器的「電腦帳號名稱」填入下方陣列
+        # ── NPS / RADIUS 伺服器專屬安全群組（用於最小權限控管）──
+        # 請將實際 NPS 與 Linux FreeRADIUS 伺服器的「電腦帳號名稱」填入下方陣列
         # （AD Computer Name，不含網域尾碼、不含結尾的 $ 符號）
         NPSServersGroupName    = 'NPS-Servers'
-        NPSServerComputerNames = @('RADIUS1')   # ← 目前僅一台，日後新增請把主機名稱加進此陣列
+        NPSServerComputerNames = @('RADIUS1', 'RADIUS3')   # ← 已將 RADIUS3 納入授權陣列
 
         # ── 憑證有效期 / 更新期（Windows FILETIME 負值 Ticks）──
         # 計算公式與 75% 更新期上限的說明，保留在 04 腳本本文內
@@ -182,8 +182,8 @@
         GroupName              = 'CEP-CES-Servers-Group'
         # 請填入這台獨立 CEP/CES 主機的 AD 電腦名稱（不含網域尾碼與 $）
         ServerComputerNames    = @('CEPCES1')
-        # 請填入後端 Sub CA 主機的 AD 電腦名稱（供設定 Kerberos 限制委派指向此主機）
-        SubCAComputerName      = 'SUBCA1'
+        # 請填入後端 Sub CA 主機的 AD 電腦名稱（供設定 Kerberos 限制委派指向此主機，對應 adcs.corp.foo.bar.tw）
+        SubCAComputerName      = 'ADCS'
 
         # ── 獨立 CEP/CES 主機對外服務的 FQDN（需與主機 DNS 名稱一致）
         ServerFQDN             = 'cepces1.corp.foo.bar.tw'
