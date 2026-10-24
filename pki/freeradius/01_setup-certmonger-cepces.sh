@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # ==============================================================================
-#  01_setup-certmonger-cepces.sh (v2 完整整合版)
+#  01_setup-certmonger-cepces.sh (v3 完美防呆終極版)
 #  自動化部署 AD 網域加入 (Samba/Winbind)、CA 憑證鏈信任、
 #  以及 certmonger + cepces (v0.5.0) 自動申請與續約 AD CS EAP-TLS 憑證腳本
 #
 #  適用系統：Debian 13 (Python 3.13)
 #  使用方式：
-#    chmod +x 01_setup-certmonger-cepces-v2.sh
-#    ./01_setup-certmonger-cepces-v2.sh
+#    chmod +x 01_setup-certmonger-cepces.sh
+#    ./01_setup-certmonger-cepces.sh
 # ==============================================================================
 set -euo pipefail
 
@@ -61,7 +61,7 @@ POST_SAVE_CMD="/bin/chown root:freerad ${KEY_PATH} ${CERT_PATH} 2>/dev/null || t
 # ──────────────────────────────────────────────────────────────────────────────
 
 echo "=============================================================================="
-echo " 開始執行 RADIUS 伺服器 AD 整合與 CEP/CES 憑證自動化部署"
+echo " 開始執行 RADIUS 伺服器 AD 整合與 CEP/CES 憑證自動化部署 (v3)"
 echo " 主機 FQDN : ${HOSTNAME_FQDN}"
 echo " 機器帳號  : ${MACHINE_ACCOUNT}@${REALM}"
 echo "=============================================================================="
@@ -78,7 +78,6 @@ if [ -z "${HOST_IP}" ]; then
 fi
 
 if [ -n "${HOST_IP}" ]; then
-    # 移除舊的同名紀錄並寫入最新設定
     sed -i "/[[:space:]]${HOSTNAME_FQDN}/d" /etc/hosts
     echo "${HOST_IP}     ${HOSTNAME_FQDN} ${SHORT_HOSTNAME}" >> /etc/hosts
     echo "    [OK] 已寫入 /etc/hosts: ${HOST_IP} -> ${HOSTNAME_FQDN} ${SHORT_HOSTNAME}"
@@ -92,7 +91,7 @@ fi
 echo ""
 echo "==> [2/8] 安裝並設定 Chrony 時間同步 (確保 Kerberos 時間誤差小於 5 分鐘)..."
 apt-get update
-apt-get install -y chrony wget ca-certificates
+apt-get install -y chrony wget ca-certificates openssl
 systemctl enable --now chrony
 systemctl restart chrony
 sleep 2
@@ -106,7 +105,7 @@ echo "==> [3/8] 下載 Root CA 與 Sub CA 憑證並更新系統信任庫..."
 wget -q "${ROOT_CA_CRT_URL}" -O "${LOCAL_ROOT_CA_CRT}"
 wget -q "${SUB_CA_CRT_URL}" -O "${LOCAL_SUB_CA_CRT}"
 
-# 若下載下來的憑證為 DER (二進位) 格式，自動轉換為 PEM 格式以確保 update-ca-certificates 正確識別
+# 自動檢查並將 DER (二進位) 格式轉為 PEM 格式，避免 update-ca-certificates 忽略檔案
 for crt_file in "${LOCAL_ROOT_CA_CRT}" "${LOCAL_SUB_CA_CRT}"; do
     if ! grep -q "BEGIN CERTIFICATE" "${crt_file}"; then
         echo "    [INFO] 偵測到 ${crt_file} 為 DER 格式，自動轉換為 PEM 格式..."
@@ -125,7 +124,6 @@ echo ""
 echo "==> [4/8] 安裝 Samba / Winbind 與 Kerberos 套件並設定組態..."
 DEBIAN_FRONTEND=noninteractive apt-get install -y samba winbind libpam-winbind libnss-winbind krb5-user smbclient
 
-# 備份原始設定檔
 [ -f /etc/samba/smb.conf ] && [ ! -f /etc/samba/smb.conf.bak ] && cp -a /etc/samba/smb.conf /etc/samba/smb.conf.bak
 [ -f /etc/krb5.conf ] && [ ! -f /etc/krb5.conf.bak ] && cp -a /etc/krb5.conf /etc/krb5.conf.bak
 
@@ -163,7 +161,6 @@ cat << EOF > /etc/samba/smb.conf
     winbind offline logon = yes
 EOF
 
-# 建立 Kerberos 設定檔
 cat << EOF > /etc/krb5.conf
 [libdefaults]
     default_realm = ${REALM}
@@ -176,7 +173,6 @@ EOF
 
 systemctl stop smbd nmbd winbind || true
 
-# 檢查是否已經加入網域，若未加入則執行互動式 net ads join
 if ! net ads testjoin -P >/dev/null 2>&1; then
     echo "    [ACTION] 請輸入網域管理員 (${AD_ADMIN_USER}@${REALM}) 密碼以加入 AD 網域："
     net ads join -U "${AD_ADMIN_USER}"
@@ -188,13 +184,17 @@ systemctl enable smbd nmbd winbind
 systemctl restart smbd nmbd winbind
 
 echo "    [INFO] 產生並驗證 ${KEYTAB_PATH}..."
-net ads keytab create -P
+# 直接由本機 secrets.tdb 產生 keytab，若已存在則補齊條目
+net ads keytab create -P 2>/dev/null || net ads keytab create
 chmod 600 "${KEYTAB_PATH}"
 
 wbinfo -t
 echo "    [INFO] 測試讀取前 5 筆 AD 使用者與群組："
+# 暫時關閉 pipefail 避免 head 提早關閉管道引發 SIGPIPE (Exit 141) 中斷腳本
+set +o pipefail
 wbinfo -u | head -n 5 || true
 wbinfo -g | head -n 5 || true
+set -o pipefail
 klist -k "${KEYTAB_PATH}"
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -208,7 +208,6 @@ rm -rf "${CEPCES_VENV_DIR}" "${CEPCES_SRC_DIR}"
 python3 -m venv "${CEPCES_VENV_DIR}"
 "${CEPCES_VENV_DIR}/bin/pip" install --upgrade pip setuptools wheel
 
-# 從官方 GitHub 安裝 cepces 與 requests-gssapi
 "${CEPCES_VENV_DIR}/bin/pip" install "git+${CEPCES_GIT_URL}" requests-gssapi
 git clone "${CEPCES_GIT_URL}" "${CEPCES_SRC_DIR}"
 
@@ -228,8 +227,10 @@ CERTMONGER_OPERATION=IDENTIFY "${CEPCES_SUBMIT_BIN}"
 #  [步驟 6/8] 設定 /etc/cepces/cepces.conf (相容 v0.5.0 新版結構)
 # ══════════════════════════════════════════════════════════════════════════════
 echo ""
-echo "==> [6/8] 寫入 /etc/cepces/cepces.conf (避開 v0.5.0 解析 Bug)..."
+echo "==> [6/8] 寫入 /etc/cepces/cepces.conf (避開 v0.5.0 解析 Bug 與 $ 號轉義陷阱)..."
 mkdir -p /etc/cepces
+# 注意：在設定檔內若寫入含 $ 的名稱，Python ExtendedInterpolation 必須使用雙錢字號 ($$)，
+# 同時我們也會在 getcert add-ca 命令列透過 --principals 傳入，確保雙重相容。
 cat << EOF > /etc/cepces/cepces.conf
 [global]
 endpoint = ${CEP_ENDPOINT}
@@ -240,7 +241,7 @@ openssl_ciphers = DEFAULT:@SECLEVEL=2
 
 [kerberos]
 keytab = ${KEYTAB_PATH}
-principals = ${MACHINE_ACCOUNT}@${REALM}
+principals = ${SHORT_HOSTNAME^^}\$\$@${REALM}
 enctypes = aes256-cts-hmac-sha1-96
 delegate = True
 EOF
@@ -253,13 +254,12 @@ echo ""
 echo "==> [7/8] 註冊 Certmonger CA (${CA_NAME}) 並申請 ${KEY_SIZE}-bit 憑證..."
 systemctl restart certmonger
 
-# 清除舊請求與舊 CA 設定以確保冪等性
 getcert stop-tracking -i "${REQUEST_ID}" 2>/dev/null || true
 getcert remove-ca -c "${CA_NAME}" 2>/dev/null || true
 rm -f "${KEY_PATH}" "${CERT_PATH}"
 
-# 註冊自訂 CA，明確傳遞電腦帳號 Principal
-getcert add-ca -c "${CA_NAME}" -e "${CEPCES_SUBMIT_BIN} --principals ${MACHINE_ACCOUNT}@${REALM}"
+# 註冊自訂 CA，明確傳遞 --auth、--keytab 與電腦帳號 --principals
+getcert add-ca -c "${CA_NAME}" -e "${CEPCES_SUBMIT_BIN} --auth Kerberos --keytab ${KEYTAB_PATH} --principals ${MACHINE_ACCOUNT}@${REALM}"
 
 # 發起憑證申請 (含 -g 4096 最小金鑰長度要求與自動續約後置腳本 -C)
 getcert request -c "${CA_NAME}" \
@@ -276,14 +276,35 @@ getcert request -c "${CA_NAME}" \
   -C "${POST_SAVE_CMD}"
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  [步驟 8/8] 等待憑證核發並輸出驗證結果
+#  [步驟 8/8] 等待憑證核發並檢查最終狀態
 # ══════════════════════════════════════════════════════════════════════════════
 echo ""
-echo "==> [8/8] 等待 5 秒讓 Certmonger 完成金鑰生成與憑證核發..."
-sleep 5
-getcert list -i "${REQUEST_ID}"
+echo "==> [8/8] 等待 Certmonger 完成 4096-bit 金鑰生成與憑證核發..."
+for i in {1..10}; do
+    sleep 2
+    STATUS=$(getcert list -i "${REQUEST_ID}" | awk -F': ' '/status:/ {print $2}' | tr -d '[:space:]')
+    echo "    [等待中 ${i}/10] 目前狀態: ${STATUS}"
+    if [ "${STATUS}" = "MONITORING" ] || [ "${STATUS}" = "CA_REJECTED" ] || [ "${STATUS}" = "CA_UNREACHABLE" ]; then
+        break
+    fi
+done
 
-echo "=============================================================================="
-echo " 部署腳本執行完畢！"
-echo " 確認上方 status: MONITORING 且 stuck: no 即代表憑證已成功簽發並啟用自動續約。"
-echo "=============================================================================="
+echo ""
+getcert list -i "${REQUEST_ID}"
+echo ""
+
+if [ "${STATUS}" = "MONITORING" ]; then
+    echo "=============================================================================="
+    echo " [SUCCESS] 恭喜！憑證已成功簽發並進入 MONITORING 自動監控續約狀態！"
+    echo "   憑證路徑 : ${CERT_PATH}"
+    echo "   私鑰路徑 : ${KEY_PATH}"
+    echo "=============================================================================="
+elif [ "${STATUS}" = "CA_REJECTED" ]; then
+    echo "=============================================================================="
+    echo " [提醒] 狀態為 CA_REJECTED (Denied by Policy Module)。"
+    echo " 若這是全新加入網域的機器 (${MACHINE_ACCOUNT})，請確認已在 Sub CA 上執行："
+    echo "   08_prepare_cepces_ad_and_template.ps1 (將 ${SHORT_HOSTNAME} 加入 CAConfig.psd1)"
+    echo " 賦予範本讀取與註冊權限後，只需在本機執行以下指令即可立即領取憑證："
+    echo "   getcert resubmit -i ${REQUEST_ID}"
+    echo "=============================================================================="
+fi
