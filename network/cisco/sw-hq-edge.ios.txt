@@ -289,6 +289,7 @@ aaa group server radius NPS-GROUP
  server name NPS-1
  server name NPS-2
  deadtime 5
+radius-server vsa send authentication
 
 aaa authentication dot1x default group NPS-GROUP
 aaa authorization network default group NPS-GROUP

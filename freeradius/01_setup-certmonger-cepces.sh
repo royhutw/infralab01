@@ -166,6 +166,7 @@ cat << EOF > /etc/krb5.conf
     default_realm = ${REALM}
     dns_lookup_realm = false
     dns_lookup_kdc = true
+    rdns = false
     ticket_lifetime = 24h
     renew_lifetime = 7d
     forwardable = true

@@ -1,18 +1,19 @@
 #!/usr/bin/env bash
 # ==============================================================================
-#  02_setup-freeradius.sh (v3 企業級 802.1X EAP-TEAP + MAB 動態 VLAN 終極定案版)
-#  適用系統：Debian 13 (Trixie) / FreeRADIUS 3.2.x
+#  02_setup-freeradius.sh (v4 實機驗證完畢・零修補終極正式版)
+#  適用系統：Debian 13 (Trixie) / FreeRADIUS 3.2.7
 #  前置條件：已執行 01_setup-certmonger-cepces.sh 完成 AD 加域與 CEP/CES 憑證簽發
 #
 #  功能摘要：
-#    1. 合成內部專屬 PKI 信任鏈 (SubCA + RootCA)，防止公有 CA 塞爆 C2960X EAP 封包
-#    2. 配置 Kerberos TGT 自動續約服務 (freerad-kinit.timer)，供 rlm_ldap GSSAPI 查 AD
-#    3. 配置 EAP-TEAP (Phase 2 雙階段 EAP-TLS 憑證驗證，fragment_size=1024)
-#    4. 實作嚴格五段式 AD 群組動態 VLAN 派發与帳號啟用狀態 (`userAccountControl`) 檢查：
+#    1. 安裝 FreeRADIUS、LDAP、Kerberos 與 SASL GSSAPI 模組
+#    2. 合成內部專屬 PKI 信任鏈 (SubCA + RootCA)，防止公有 CA 塞爆 C2960X EAP 封包
+#    3. 自動偵測 AD DC FQDN，設定 Kerberos rdns=false、SASL_NOCANON 與 TGT 自動續約
+#    4. 配置 EAP-TEAP (Phase 2 雙階段 EAP-TLS 憑證驗證，fragment_size=1024)
+#    5. 實作五段式 AD 群組動態 VLAN 派發與帳號啟用狀態 (`userAccountControl`) 檢查：
 #       - MachineAuth : SG-HQ-8021X-VLAN([0-9]+)-[^,]+-Computers
-#       - UserAuth    : SG-HQ-8021X-VLAN([0-9]+)-[^,]+-Users
-#       - MAB (納管)  : SG-HQ-8021X-VLAN([0-9]+)-[^,]+-MAB
-#       - MAB (停用/移出群組) : 明確回傳 Access-Reject (觸發交換器 event fail 進 VLAN 98)
+#       - UserAuth    : SG-HQ-8021X-VLAN([0-9]+)-[^,]+-Users (優先權高於 MachineAuth)
+#       - MAB (啟用)  : SG-HQ-8021X-VLAN([0-9]+)-[^,]+-MAB
+#       - MAB (停用/移出群組) : Access-Reject (觸發交換器 event fail 進 VLAN 98)
 #       - MAB (未知 MAC)      : AD 查無帳號時自動放行至 Guest VLAN 90
 # ==============================================================================
 set -euo pipefail
@@ -28,8 +29,10 @@ MACHINE_PRINCIPAL="${SHORT_HOSTNAME^^}\$@${REALM}"
 BASE_DN="DC=corp,DC=foo,DC=bar,DC=tw"
 HQ_GROUP_OU="OU=8021X-HQ,OU=HQ,${BASE_DN}"
 
-# LDAP 伺服器 (透過網域 FQDN 自動連向 AD DC)
-LDAP_SERVER="ldap://${DOMAIN}"
+# 自動透過 DNS SRV 紀錄偵測 AD Domain Controller FQDN (若偵測失敗則預設使用 dc01)
+DETECTED_DC=$(host -t SRV "_ldap._tcp.dc._msdcs.${DOMAIN}" 2>/dev/null | awk '{print $NF}' | sed 's/\.$//' | head -n 1 || true)
+DC_FQDN="${DETECTED_DC:-dc01.${DOMAIN}}"
+LDAP_SERVER="ldap://${DC_FQDN}"
 
 # ── [2. 交換器 (RADIUS Clients) 與 VLAN / 計時器參數區] ──────────────────────
 SW_SUBNET="192.168.10.0/24"
@@ -52,12 +55,14 @@ CORP_CA_CHAIN="${FR_CONF_DIR}/certs/corp_ca_chain.pem"
 CERT_PATH="/etc/ssl/certs/${SHORT_HOSTNAME}.crt"
 KEY_PATH="/etc/ssl/private/${SHORT_HOSTNAME}.key"
 KEYTAB_PATH="/etc/krb5.keytab"
-KRB5_CCACHE="/tmp/krb5cc_freerad"
+KRB5_CCACHE_DIR="/var/lib/freeradius"
+KRB5_CCACHE="${KRB5_CCACHE_DIR}/krb5cc_freerad"
 # ──────────────────────────────────────────────────────────────────────────────
 
 echo "=============================================================================="
-echo " 開始執行 FreeRADIUS 802.1X (EAP-TEAP / MAB / Dynamic VLAN) 自動化部署"
+echo " 開始執行 FreeRADIUS 802.1X (EAP-TEAP / MAB / Dynamic VLAN) 自動化部署 (v4)"
 echo " 主機 FQDN  : ${HOSTNAME_FQDN}"
+echo " 目標 AD DC : ${LDAP_SERVER}"
 echo " 目標群組 OU: ${HQ_GROUP_OU}"
 echo " 交換器網段 : ${SW_SUBNET}"
 echo "=============================================================================="
@@ -66,15 +71,16 @@ echo "==========================================================================
 #  [步驟 1/7] 安裝 FreeRADIUS 與相關模組套件
 # ══════════════════════════════════════════════════════════════════════════════
 echo ""
-echo "==> [1/7] 安裝 FreeRADIUS、LDAP 模組與 ACL 工具..."
+echo "==> [1/7] 安裝 FreeRADIUS、LDAP、SASL GSSAPI 與 ACL 工具..."
 apt-get update
 DEBIAN_FRONTEND=noninteractive apt-get install -y \
     freeradius \
     freeradius-ldap \
     freeradius-krb5 \
     freeradius-utils \
-    acl \
-    ldap-utils
+    libsasl2-modules-gssapi-mit \
+    ldap-utils \
+    acl
 
 systemctl stop freeradius || true
 
@@ -113,9 +119,21 @@ echo "    [OK] 內部 CA 憑證鏈與私鑰/Keytab 權限配置完成。"
 #  [步驟 3/7] 配置 Kerberos Ticket 自動維護機制 (供 rlm_ldap GSSAPI 使用)
 # ══════════════════════════════════════════════════════════════════════════════
 echo ""
-echo "==> [3/7] 配置 Kerberos TGT 自動續約服務 (freerad-kinit.timer)..."
+echo "==> [3/7] 配置 Kerberos/SASL 參數與 TGT 自動續約服務 (freerad-kinit.timer)..."
+
+# 關閉 Kerberos 與 OpenLDAP SASL 的反向 DNS 猜測，防止發生 Server not found in Kerberos database
+if ! grep -q "rdns = false" /etc/krb5.conf; then
+    sed -i '/\[libdefaults\]/a \    rdns = false' /etc/krb5.conf
+fi
+if ! grep -q "SASL_NOCANON" /etc/ldap/ldap.conf; then
+    echo "SASL_NOCANON on" >> /etc/ldap/ldap.conf
+fi
+
+# 建立不受 systemd PrivateTmp 影響的專屬票證快取目錄
+install -d -m 0750 -o freerad -g freerad "${KRB5_CCACHE_DIR}"
+
 # 立即為 freerad 取得初始 Kerberos Ticket
-sudo -u freerad kinit -k -t "${KEYTAB_PATH}" -c "${KRB5_CCACHE}" "${MACHINE_PRINCIPAL}"
+runuser -u freerad -- kinit -k -t "${KEYTAB_PATH}" -c "${KRB5_CCACHE}" "${MACHINE_PRINCIPAL}"
 
 cat << EOF > /etc/systemd/system/freerad-kinit.service
 [Unit]
@@ -202,7 +220,6 @@ ldap {
     }
 
     # 將 AD 的 memberOf 映射到 control:LDAP-Group，並將 userAccountControl 抓回至 Tmp-Integer-0
-    # 以便在 unlang 中區分「查無帳號 (notfound)」與「帳號已停用 (bit 2 = 1)」
     update {
         control:LDAP-Group += 'memberOf'
         control:Tmp-Integer-0 := 'userAccountControl'
@@ -211,7 +228,6 @@ ldap {
     user {
         base_dn = "${..base_dn}"
         scope = 'sub'
-        # 支援電腦帳號 (sAMAccountName=PC01$)、使用者 UPN、一般帳號與 12 碼 MAB 帳號查詢
         filter = "(|(sAMAccountName=%{%{Stripped-User-Name}:-%{User-Name}})(userPrincipalName=%{User-Name}))"
         sasl {
             mech = 'GSSAPI'
@@ -228,8 +244,9 @@ ldap {
     }
 
     options {
-        chase_referrals = yes
-        rebind = yes
+        # 關閉 AD 跨區 Referral 追蹤 (避免卡在 ForestDnsZones / DomainDnsZones)
+        chase_referrals = no
+        rebind = no
         res_timeout = 10
         srv_timelimit = 3
         net_timeout = 1
@@ -315,8 +332,9 @@ eap {
     # EAP-TEAP (RFC 7170) 主設定
     teap {
         tls = tls-common
+        authority_identity = "${HOSTNAME_FQDN}"
         default_method = tls
-        inner_server = "inner-tunnel"
+        virtual_server = "inner-tunnel"
         include_length = yes
         auto_chain = yes
     }
@@ -368,7 +386,7 @@ evaluate_eap_vlan {
     }
 
     # 檢查 AD 帳號是否被停用 (userAccountControl Bit 2: ACCOUNTDISABLE = 2)
-    if (&control:Tmp-Integer-0 && ((&control:Tmp-Integer-0 & 2) == 2)) {
+    if (&control:Tmp-Integer-0 && ("%{expr:%{control:Tmp-Integer-0} & 2}" == "2")) {
         reject
     }
 
@@ -376,7 +394,6 @@ evaluate_eap_vlan {
     if ((&User-Name =~ /^host\//i) || (&Stripped-User-Name && (&Stripped-User-Name =~ /\$$/))) {
         foreach &control:LDAP-Group {
             if ("%{Foreach-Variable-0}" =~ /^CN=SG-HQ-8021X-VLAN([0-9]+)-[^,]+-Computers,/i) {
-                # 僅在尚未完成 UserAuth 時寫入 Machine VLAN，確保 UserAuth 優先權高於 MachineAuth
                 if (!&session-state:Tmp-String-1 || (&session-state:Tmp-String-1 != "USER_AUTH_DONE")) {
                     update session-state {
                         &Tmp-String-0 := "%{1}"
@@ -409,7 +426,6 @@ evaluate_eap_vlan {
 
 # [C] MAB 驗證與設備/訪客動態 VLAN 計算
 evaluate_mab_vlan {
-    # 統一轉為 12 碼小寫以匹配 AD 中的 MAB sAMAccountName
     update request {
         &Stripped-User-Name := "%{tolower:%{User-Name}}"
     }
@@ -417,8 +433,8 @@ evaluate_mab_vlan {
     ldap
     # 情況 1：AD 中存在此 MAC 帳號
     if (ok || updated) {
-        # 若該 MAC 帳號在 AD 被停用 (ACCOUNTDISABLE = 2) -> 直接拒絕 (交換器將依 event fail 移入 VLAN 98)
-        if (&control:Tmp-Integer-0 && ((&control:Tmp-Integer-0 & 2) == 2)) {
+        # 若該 MAC 帳號在 AD 被停用 (例如 514, 66050 -> Bit 2 = 2) -> 直接拒絕 (交換器導向 VLAN 98)
+        if (&control:Tmp-Integer-0 && ("%{expr:%{control:Tmp-Integer-0} & 2}" == "2")) {
             reject
         }
 
@@ -432,12 +448,12 @@ evaluate_mab_vlan {
             }
         }
 
-        # 若帳號存在於 AD 卻未加入任何 -MAB 群組 (被管理員移出群組) -> 直接拒絕 (移入 VLAN 98)
+        # 若未加入任何 -MAB 群組 -> 直接拒絕 (交換器導向 VLAN 98)
         if (!&session-state:Tmp-String-0) {
             reject
         }
     }
-    # 情況 2：AD 中完全查無此 MAC 帳號 -> 視為未知訪客設備，放行至 Guest VLAN 90
+    # 情況 2：AD 中查無此 MAC 帳號 -> 視為未知訪客設備，放行至 Guest VLAN 90
     elsif (notfound) {
         update session-state {
             &Tmp-String-0 := "__GUEST_VLAN__"
@@ -480,7 +496,7 @@ server check-eap-tls {
 EOF
 ln -sf "${FR_CONF_DIR}/sites-available/check-eap-tls" "${FR_CONF_DIR}/sites-enabled/check-eap-tls"
 
-# 7.3 設定 inner-tunnel 虛擬伺服器 (供 EAP-TEAP Phase 2 呼叫並將結果傳回外層)
+# 7.3 設定 inner-tunnel 虛擬伺服器
 [ ! -f "${FR_CONF_DIR}/sites-available/inner-tunnel.bak" ] && \
     cp -a "${FR_CONF_DIR}/sites-available/inner-tunnel" "${FR_CONF_DIR}/sites-available/inner-tunnel.bak"
 
@@ -611,7 +627,7 @@ systemctl restart freeradius
 systemctl status freeradius --no-pager
 
 echo "=============================================================================="
-echo " [SUCCESS] FreeRADIUS 802.1X 動態 VLAN 伺服器部署完成！"
+echo " [SUCCESS] FreeRADIUS 802.1X 動態 VLAN 伺服器部署完成 (v4)！"
 echo "   - 專屬內部 CA 鏈 : ${CORP_CA_CHAIN}"
 echo "   - 交換器允許網段 : ${SW_SUBNET}"
 echo "   - MachineAuth    : SG-HQ-8021X-VLAN<ID>-*-Computers"
