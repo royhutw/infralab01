@@ -1,67 +1,27 @@
 #!/usr/bin/env bash
 # ==============================================================================
-#  01_setup-certmonger-cepces.sh (v3 完美防呆終極版)
+#  01_setup-certmonger-cepces.sh (v4 集中化設定檔版)
 #  自動化部署 AD 網域加入 (Samba/Winbind)、CA 憑證鏈信任、
 #  以及 certmonger + cepces (v0.5.0) 自動申請與續約 AD CS EAP-TLS 憑證腳本
 #
 #  適用系統：Debian 13 (Python 3.13)
-#  使用方式：
-#    chmod +x 01_setup-certmonger-cepces.sh
-#    ./01_setup-certmonger-cepces.sh
+#  前置檔案：同目錄下需存在 config.env
 # ==============================================================================
 set -euo pipefail
 
-# ── [1. 網域與主機基本參數設定區] ─────────────────────────────────────────────
-DOMAIN="corp.foo.bar.tw"
-REALM="CORP.FOO.BAR.TW"
-NETBIOS="CORP"
+# ── [載入共用環境參數設定檔] ─────────────────────────────────────────────────
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONFIG_FILE="${SCRIPT_DIR}/config.env"
 
-SHORT_HOSTNAME="radius3"
-HOSTNAME_FQDN="${SHORT_HOSTNAME}.${DOMAIN}"
-# 自動轉大寫並加上 $ 號 (例如 RADIUS3$)
-MACHINE_ACCOUNT="${SHORT_HOSTNAME^^}$"
-
-# 本機 IP 位址 (若留空，腳本會自動偵測預設網卡 IPv4 位址以寫入 /etc/hosts)
-HOST_IP=""
-
-# 加入 AD 網域使用的管理員帳號 (執行至 net ads join 時將提示輸入密碼)
-AD_ADMIN_USER="Administrator"
-KEYTAB_PATH="/etc/krb5.keytab"
-
-# ── [2. PKI 憑證信任鏈 (Root CA / Sub CA) 下載 URL 參數區] ────────────────────
-CRL_BASE_URL="http://crl.${DOMAIN}"
-SUBCA_HOSTNAME="adcs.${DOMAIN}"
-SUBCA_COMMON_NAME="corp-foo-bar-tw-SubCA"
-
-ROOT_CA_CRT_URL="${CRL_BASE_URL}/RootCA.crt"
-SUB_CA_CRT_URL="${CRL_BASE_URL}/AIA/${SUBCA_HOSTNAME}_${SUBCA_COMMON_NAME}.crt"
-
-LOCAL_ROOT_CA_CRT="/usr/local/share/ca-certificates/RootCA.crt"
-LOCAL_SUB_CA_CRT="/usr/local/share/ca-certificates/SubCA.crt"
-
-# ── [3. CEP/CES 與 Certmonger 憑證申請參數區] ────────────────────────────────
-CEPCES_SERVER="cepces1.${DOMAIN}"
-CEP_ENDPOINT="https://${CEPCES_SERVER}/ADPolicyProvider_CEP_Kerberos/service.svc/CEP"
-
-CEPCES_GIT_URL="https://github.com/openSUSE/cepces.git"
-CEPCES_VENV_DIR="/opt/cepces"
-CEPCES_SRC_DIR="/opt/cepces-src"
-CEPCES_SUBMIT_BIN="/usr/local/bin/cepces-submit"
-
-CA_NAME="CEP-CES"
-REQUEST_ID="RADIUS-EAP-TLS"
-PROFILE_NAME="EAP-TLS-NPS-Server"
-KEY_SIZE="4096"
-
-CERT_PATH="/etc/ssl/certs/${SHORT_HOSTNAME}.crt"
-KEY_PATH="/etc/ssl/private/${SHORT_HOSTNAME}.key"
-
-# 憑證核發或自動續約後的自動化處理腳本 (修正私鑰權限並重載 FreeRADIUS)
-POST_SAVE_CMD="/bin/chown root:freerad ${KEY_PATH} ${CERT_PATH} 2>/dev/null || true; /bin/chmod 640 ${KEY_PATH}; /bin/systemctl reload freeradius 2>/dev/null || true"
+if [ ! -f "${CONFIG_FILE}" ]; then
+    echo "[ERROR] 找不到共用設定檔: ${CONFIG_FILE}" >&2
+    exit 1
+fi
+source "${CONFIG_FILE}"
 # ──────────────────────────────────────────────────────────────────────────────
 
 echo "=============================================================================="
-echo " 開始執行 RADIUS 伺服器 AD 整合與 CEP/CES 憑證自動化部署 (v3)"
+echo " 開始執行 RADIUS 伺服器 AD 整合與 CEP/CES 憑證自動化部署 (v4)"
 echo " 主機 FQDN : ${HOSTNAME_FQDN}"
 echo " 機器帳號  : ${MACHINE_ACCOUNT}@${REALM}"
 echo "=============================================================================="
@@ -79,8 +39,8 @@ fi
 
 if [ -n "${HOST_IP}" ]; then
     sed -i "/[[:space:]]${HOSTNAME_FQDN}/d" /etc/hosts
-    echo "${HOST_IP}     ${HOSTNAME_FQDN} ${SHORT_HOSTNAME}" >> /etc/hosts
-    echo "    [OK] 已寫入 /etc/hosts: ${HOST_IP} -> ${HOSTNAME_FQDN} ${SHORT_HOSTNAME}"
+    echo "${HOST_IP}     ${HOSTNAME_FQDN}${SHORT_HOSTNAME}" >> /etc/hosts
+    echo "    [OK] 已寫入 /etc/hosts: ${HOST_IP} -> ${HOSTNAME_FQDN}${SHORT_HOSTNAME}"
 else
     echo "    [WARNING] 無法自動偵測本機 IP，請手動確認 /etc/hosts 是否包含 ${HOSTNAME_FQDN}"
 fi
@@ -185,13 +145,11 @@ systemctl enable smbd nmbd winbind
 systemctl restart smbd nmbd winbind
 
 echo "    [INFO] 產生並驗證 ${KEYTAB_PATH}..."
-# 直接由本機 secrets.tdb 產生 keytab，若已存在則補齊條目
 net ads keytab create -P 2>/dev/null || net ads keytab create
 chmod 600 "${KEYTAB_PATH}"
 
 wbinfo -t
 echo "    [INFO] 測試讀取前 5 筆 AD 使用者與群組："
-# 暫時關閉 pipefail 避免 head 提早關閉管道引發 SIGPIPE (Exit 141) 中斷腳本
 set +o pipefail
 wbinfo -u | head -n 5 || true
 wbinfo -g | head -n 5 || true
@@ -212,12 +170,11 @@ python3 -m venv "${CEPCES_VENV_DIR}"
 "${CEPCES_VENV_DIR}/bin/pip" install "git+${CEPCES_GIT_URL}" requests-gssapi
 git clone "${CEPCES_GIT_URL}" "${CEPCES_SRC_DIR}"
 
-# 建立包裝腳本 (強制導入系統 CA 信任存放區並呼叫虛擬環境 Python)
 cat << EOF > "${CEPCES_SUBMIT_BIN}"
 #!/usr/bin/env bash
 export REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
 export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
-exec ${CEPCES_VENV_DIR}/bin/python3 ${CEPCES_SRC_DIR}/bin/cepces-submit "\$@"
+exec ${CEPCES_VENV_DIR}/bin/python3${CEPCES_SRC_DIR}/bin/cepces-submit "\$@"
 EOF
 chmod +x "${CEPCES_SUBMIT_BIN}"
 
@@ -230,8 +187,6 @@ CERTMONGER_OPERATION=IDENTIFY "${CEPCES_SUBMIT_BIN}"
 echo ""
 echo "==> [6/8] 寫入 /etc/cepces/cepces.conf (避開 v0.5.0 解析 Bug 與 $ 號轉義陷阱)..."
 mkdir -p /etc/cepces
-# 注意：在設定檔內若寫入含 $ 的名稱，Python ExtendedInterpolation 必須使用雙錢字號 ($$)，
-# 同時我們也會在 getcert add-ca 命令列透過 --principals 傳入，確保雙重相容。
 cat << EOF > /etc/cepces/cepces.conf
 [global]
 endpoint = ${CEP_ENDPOINT}
@@ -259,10 +214,8 @@ getcert stop-tracking -i "${REQUEST_ID}" 2>/dev/null || true
 getcert remove-ca -c "${CA_NAME}" 2>/dev/null || true
 rm -f "${KEY_PATH}" "${CERT_PATH}"
 
-# 註冊自訂 CA，明確傳遞 --auth、--keytab 與電腦帳號 --principals
-getcert add-ca -c "${CA_NAME}" -e "${CEPCES_SUBMIT_BIN} --auth Kerberos --keytab ${KEYTAB_PATH} --principals ${MACHINE_ACCOUNT}@${REALM}"
+getcert add-ca -c "${CA_NAME}" -e "${CEPCES_SUBMIT_BIN} --auth Kerberos --keytab${KEYTAB_PATH} --principals ${MACHINE_ACCOUNT}@${REALM}"
 
-# 發起憑證申請 (含 -g 4096 最小金鑰長度要求與自動續約後置腳本 -C)
 getcert request -c "${CA_NAME}" \
   -I "${REQUEST_ID}" \
   -T "${PROFILE_NAME}" \
@@ -280,12 +233,12 @@ getcert request -c "${CA_NAME}" \
 #  [步驟 8/8] 等待憑證核發並檢查最終狀態
 # ══════════════════════════════════════════════════════════════════════════════
 echo ""
-echo "==> [8/8] 等待 Certmonger 完成 4096-bit 金鑰生成與憑證核發..."
+echo "==> [8/8] 等待 Certmonger 完成 ${KEY_SIZE}-bit 金鑰生成與憑證核發..."
 for i in {1..10}; do
     sleep 2
     STATUS=$(getcert list -i "${REQUEST_ID}" | awk -F': ' '/status:/ {print $2}' | tr -d '[:space:]')
     echo "    [等待中 ${i}/10] 目前狀態: ${STATUS}"
-    if [ "${STATUS}" = "MONITORING" ] || [ "${STATUS}" = "CA_REJECTED" ] || [ "${STATUS}" = "CA_UNREACHABLE" ]; then
+    if [ "${STATUS}" = "MONITORING" ] || [ "${STATUS}" = "CA_REJECTED" ] \vert{}\vert{} [ "${STATUS}" = "CA_UNREACHABLE" ]; then
         break
     fi
 done
