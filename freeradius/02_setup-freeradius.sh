@@ -1,6 +1,7 @@
+cat << 'EOF' > 02_setup-freeradius.sh
 #!/usr/bin/env bash
 # ==============================================================================
-#  02_setup-freeradius.sh (v5 集中化設定檔版)
+#  02_setup-freeradius.sh (v6 終極實戰驗收版・支援 EAP-TEAP / EAP-TLS / MAB)
 #  適用系統：Debian 13 (Trixie) / FreeRADIUS 3.2.7
 #  前置條件：
 #    1. 同目錄下需存在 config.env
@@ -20,7 +21,7 @@ source "${CONFIG_FILE}"
 # ──────────────────────────────────────────────────────────────────────────────
 
 echo "=============================================================================="
-echo " 開始執行 FreeRADIUS 802.1X (EAP-TEAP / MAB / Dynamic VLAN) 自動化部署 (v5)"
+echo " 開始執行 FreeRADIUS 802.1X (EAP-TEAP / EAP-TLS / MAB) 自動化部署 (v6)"
 echo " 主機 FQDN  : ${HOSTNAME_FQDN}"
 echo " 目標 AD DC : ${LDAP_SERVER}"
 echo " 目標群組 OU: ${HQ_GROUP_OU}"
@@ -231,7 +232,7 @@ chown -h root:freerad "${FR_CONF_DIR}/mods-available/ldap" "${FR_CONF_DIR}/mods-
 chmod 640 "${FR_CONF_DIR}/mods-available/ldap"
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  [步驟 6/7] 設定 EAP 模組 (EAP-TEAP 內外層皆使用憑證驗證 + 分片最佳化)
+#  [步驟 6/7] 設定 EAP 模組 (EAP-TEAP / EAP-TLS + 分片最佳化)
 # ══════════════════════════════════════════════════════════════════════════════
 echo ""
 echo "==> [6/7] 設定 EAP 模組 (${FR_CONF_DIR}/mods-available/eap)..."
@@ -300,16 +301,16 @@ echo "==> [7/7] 寫入五段式群組動態 VLAN 策略與虛擬伺服器組態.
 
 cat << 'EOF' > "${FR_CONF_DIR}/policy.d/corp_8021x_vlan"
 # ==============================================================================
-#  CORP.FOO.BAR.TW 802.1X 動態 VLAN 指派核心邏輯 (對齊五段式群組命名)
+#  CORP.FOO.BAR.TW 802.1X 動態 VLAN 指派核心邏輯 (支援 EAP-TEAP / EAP-TLS / MAB)
 # ==============================================================================
 
 normalize_ad_identity {
-    if (&TLS-Client-Cert-Common-Name && (&TLS-Client-Cert-Common-Name =~ /^([a-zA-Z0-9_-]+)\.__DOMAIN_REGEX__$/i)) {
+    if (&User-Name =~ /^host\/([a-zA-Z0-9_-]+)\.__DOMAIN_REGEX__$/i) {
         update request {
             &Stripped-User-Name := "%{1}$"
         }
     }
-    elsif (&User-Name =~ /^host\/([a-zA-Z0-9_-]+)\.__DOMAIN_REGEX__$/i) {
+    elsif (&TLS-Client-Cert-Common-Name && (&TLS-Client-Cert-Common-Name =~ /^([a-zA-Z0-9_-]+)\.__DOMAIN_REGEX__$/i)) {
         update request {
             &Stripped-User-Name := "%{1}$"
         }
@@ -324,7 +325,7 @@ normalize_ad_identity {
 evaluate_eap_vlan {
     normalize_ad_identity
 
-    ldap
+    ldap.authorize
     if (notfound) {
         reject
     }
@@ -370,7 +371,7 @@ evaluate_mab_vlan {
         &Stripped-User-Name := "%{tolower:%{User-Name}}"
     }
 
-    ldap
+    ldap.authorize
     if (ok || updated) {
         if (&control:Tmp-Integer-0 && ("%{expr:%{control:Tmp-Integer-0} & 2}" == "2")) {
             reject
@@ -400,6 +401,11 @@ evaluate_mab_vlan {
 }
 
 apply_vlan_reply {
+    # 若為單層 EAP-TLS (外層尚未填入 Tmp-String-0)，在此處透過 ldap.authorize 計算並檢查群組
+    if (!&session-state:Tmp-String-0 && &EAP-Message) {
+        evaluate_eap_vlan
+    }
+
     if (&session-state:Tmp-String-0) {
         update reply {
             &Tunnel-Type := VLAN
@@ -420,7 +426,6 @@ sed -i "s|__REAUTH_TIMEOUT__|${REAUTH_TIMEOUT}|g" "${FR_CONF_DIR}/policy.d/corp_
 cat << 'EOF' > "${FR_CONF_DIR}/sites-available/check-eap-tls"
 server check-eap-tls {
     authorize {
-        evaluate_eap_vlan
         update config {
             &Auth-Type := Accept
         }
@@ -452,6 +457,7 @@ server inner-tunnel {
     }
 
     post-auth {
+        evaluate_eap_vlan
         if (&session-state:Tmp-String-0) {
             update outer.session-state {
                 &Tmp-String-0 := &session-state:Tmp-String-0
@@ -556,12 +562,7 @@ systemctl restart freeradius
 systemctl status freeradius --no-pager
 
 echo "=============================================================================="
-echo " [SUCCESS] FreeRADIUS 802.1X 動態 VLAN 伺服器部署完成 (v5)！"
-echo "   - 專屬內部 CA 鏈 : ${CORP_CA_CHAIN}"
-echo "   - 交換器允許網段 : ${SW_SUBNET}"
-echo "   - MachineAuth    : SG-HQ-8021X-VLAN<ID>-*-Computers"
-echo "   - UserAuth       : SG-HQ-8021X-VLAN<ID>-*-Users (覆寫 Machine VLAN)"
-echo "   - MAB (納管啟用) : SG-HQ-8021X-VLAN<ID>-*-MAB"
-echo "   - MAB (停用/移出): Access-Reject (由交換器導向 Critical VLAN 98)"
-echo "   - MAB (未知設備) : Access-Accept -> Guest VLAN ${GUEST_VLAN}"
+echo " [SUCCESS] FreeRADIUS 802.1X 動態 VLAN 伺服器部署完成 (v6)！"
 echo "=============================================================================="
+EOF
+chmod +x 02_setup-freeradius.sh
