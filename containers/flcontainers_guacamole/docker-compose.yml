@@ -1,0 +1,16 @@
+services:
+  guacamole:
+    image: flcontainers/guacamole
+    container_name: guacamole
+    environment:
+      TZ: 'Asia/Taipei'
+      EXTENSIONS: 'auth-totp,auth-ldap'
+    volumes:
+      - postgres:/config
+      - /etc/localtime:/etc/localtime:ro
+    ports:
+      - 8080:8080
+    restart: unless-stopped
+volumes:
+  postgres:
+    driver: local
