@@ -43,6 +43,38 @@ $Params.ComputerGPOTarget = $Params.DomainDN
 $Params.UserGPOTarget     = $Params.DomainDN
 #endregion
 
+function Set-GPRegistryValueIfNeeded {
+    param(
+        [Parameter(Mandatory = $true)][string]$GpoName,
+        [Parameter(Mandatory = $true)][string]$Key,
+        [Parameter(Mandatory = $true)][string]$ValueName,
+        [Parameter(Mandatory = $true)][string]$Type,
+        [Parameter(Mandatory = $true)]$Value
+    )
+
+    $CurrentValue = Get-GPRegistryValue -Name $GpoName -Key $Key -ValueName $ValueName -ErrorAction SilentlyContinue
+    if ($null -ne $CurrentValue) {
+        $CurrentNormalized = switch ($Type) {
+            'DWord' { [int]$CurrentValue.Value }
+            'Binary' { if ($CurrentValue.Value -is [byte[]]) { ($CurrentValue.Value | ForEach-Object { $_.ToString('X2') }) -join '' } else { [string]$CurrentValue.Value } }
+            default { [string]$CurrentValue.Value }
+        }
+
+        $DesiredNormalized = switch ($Type) {
+            'DWord' { [int]$Value }
+            'Binary' { if ($Value -is [byte[]]) { ($Value | ForEach-Object { $_.ToString('X2') }) -join '' } else { [string]$Value } }
+            default { [string]$Value }
+        }
+
+        if ($CurrentNormalized -eq $DesiredNormalized) {
+            return $false
+        }
+    }
+
+    Set-GPRegistryValue -Name $GpoName -Key $Key -ValueName $ValueName -Type $Type -Value $Value | Out-Null
+    return $true
+}
+
 Install-WindowsFeature GPMC -ErrorAction Stop | Out-Null
 Import-Module GroupPolicy -ErrorAction Stop
 
@@ -83,13 +115,17 @@ if ($null -eq $CompGPO) {
 
 # 設定電腦 Auto-Enrollment 登錄值
 # AEPolicy = 7：啟用 + 自動更新 + 移除已撤銷/到期憑證
-Set-GPRegistryValue -Name $Params.ComputerGPOName `
-    -Key       'HKLM\SOFTWARE\Policies\Microsoft\Cryptography\AutoEnrollment' `
+$ComputerAEChanged = Set-GPRegistryValueIfNeeded -GpoName $Params.ComputerGPOName `
+    -Key 'HKLM\SOFTWARE\Policies\Microsoft\Cryptography\AutoEnrollment' `
     -ValueName 'AEPolicy' `
-    -Type      DWord `
-    -Value     7 | Out-Null
+    -Type 'DWord' `
+    -Value 7
 
-Write-Host "      [OK] 電腦 AEPolicy = 7（啟用 + 自動更新 + 清理）" -ForegroundColor Green
+if ($ComputerAEChanged) {
+    Write-Host "      [OK] 電腦 AEPolicy = 7（啟用 + 自動更新 + 清理）" -ForegroundColor Green
+} else {
+    Write-Host "      [SKIP] 電腦 AEPolicy 已為 7，未重複寫入" -ForegroundColor DarkGray
+}
 
 # 連結 GPO 至網域根層級
 $ExistingCompLink = Get-GPInheritance -Target $Params.ComputerGPOTarget -Domain $Params.DomainName |
@@ -132,13 +168,17 @@ if ($null -eq $UserGPO) {
 }
 
 # 設定使用者 Auto-Enrollment 登錄值（HKCU）
-Set-GPRegistryValue -Name $Params.UserGPOName `
-    -Key       'HKCU\SOFTWARE\Policies\Microsoft\Cryptography\AutoEnrollment' `
+$UserAEChanged = Set-GPRegistryValueIfNeeded -GpoName $Params.UserGPOName `
+    -Key 'HKCU\SOFTWARE\Policies\Microsoft\Cryptography\AutoEnrollment' `
     -ValueName 'AEPolicy' `
-    -Type      DWord `
-    -Value     7 | Out-Null
+    -Type 'DWord' `
+    -Value 7
 
-Write-Host "      [OK] 使用者 AEPolicy = 7（啟用 + 自動更新 + 清理）" -ForegroundColor Green
+if ($UserAEChanged) {
+    Write-Host "      [OK] 使用者 AEPolicy = 7（啟用 + 自動更新 + 清理）" -ForegroundColor Green
+} else {
+    Write-Host "      [SKIP] 使用者 AEPolicy 已為 7，未重複寫入" -ForegroundColor DarkGray
+}
 
 # 連結 GPO 至網域根層級
 $ExistingUserLink = Get-GPInheritance -Target $Params.UserGPOTarget -Domain $Params.DomainName |

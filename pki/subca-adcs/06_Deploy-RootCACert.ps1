@@ -21,6 +21,50 @@
 . (Join-Path $PSScriptRoot 'Import-CAConfig.ps1')
 $Params = Merge-CAConfig -Sections 'Global','ExchangePaths','DeployRootCAGPO'
 
+function Set-GPRegistryValueIfNeeded {
+    param(
+        [Parameter(Mandatory = $true)][string]$GpoName,
+        [Parameter(Mandatory = $true)][string]$Key,
+        [Parameter(Mandatory = $true)][string]$ValueName,
+        [Parameter(Mandatory = $true)][string]$Type,
+        [Parameter(Mandatory = $true)]$Value
+    )
+
+    $CurrentValue = Get-GPRegistryValue -Name $GpoName -Key $Key -ValueName $ValueName -ErrorAction SilentlyContinue
+    if ($null -ne $CurrentValue) {
+        $CurrentNormalized = switch ($Type) {
+            'Binary' {
+                if ($CurrentValue.Value -is [byte[]]) {
+                    ($CurrentValue.Value | ForEach-Object { $_.ToString('X2') }) -join ''
+                } else {
+                    [string]$CurrentValue.Value
+                }
+            }
+            'DWord' { [int]$CurrentValue.Value }
+            default { [string]$CurrentValue.Value }
+        }
+
+        $DesiredNormalized = switch ($Type) {
+            'Binary' {
+                if ($Value -is [byte[]]) {
+                    ($Value | ForEach-Object { $_.ToString('X2') }) -join ''
+                } else {
+                    [string]$Value
+                }
+            }
+            'DWord' { [int]$Value }
+            default { [string]$Value }
+        }
+
+        if ($CurrentNormalized -eq $DesiredNormalized) {
+            return $false
+        }
+    }
+
+    Set-GPRegistryValue -Name $GpoName -Key $Key -ValueName $ValueName -Type $Type -Value $Value | Out-Null
+    return $true
+}
+
 # ── 套用目標（網域根層級，涵蓋所有電腦）────────────────────
 # 直接沿用 Global.DomainDN，不再另外重複定義一份一樣的 DN 字串。
 $Params.GPOTarget = $Params.DomainDN
@@ -118,7 +162,12 @@ $LocalStore.Close()
 
 # ── 將憑證發布至 AD NTAuth 與 Root CA 容器 ───────────────────
 Write-Host "      發布 Root CA 憑證至 AD..." -ForegroundColor Gray
-certutil -dspublish -f $Params.RootCACertPath RootCA | Out-Null
+$DspublishOutput = & certutil -dspublish -f $Params.RootCACertPath RootCA 2>&1
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "      [ERROR] 發布 Root CA 憑證至 AD 失敗（退出碼：$LASTEXITCODE）" -ForegroundColor Red
+    $DspublishOutput | ForEach-Object { Write-Host "      $_" -ForegroundColor Red }
+    throw "Root CA 憑證發佈失敗。"
+}
 Write-Host "      [OK] 已發布至 AD" -ForegroundColor Green
 
 # ── 使用 GPO 登錄值部署憑證 ──────────────────────────────────
@@ -152,14 +201,24 @@ $BlobPrefix = [byte[]](
 )
 $BlobData = $BlobPrefix + $CertBytes
 
-Set-GPRegistryValue -Name $Params.GPOName `
-    -Key       $RegKey `
-    -ValueName 'Blob' `
-    -Type      Binary `
-    -Value     $BlobData | Out-Null
+try {
+    $BlobChanged = Set-GPRegistryValueIfNeeded -GpoName $Params.GPOName `
+        -Key $RegKey `
+        -ValueName 'Blob' `
+        -Type 'Binary' `
+        -Value $BlobData
 
-Write-Host "      [OK] 憑證已寫入 GPO 登錄設定" -ForegroundColor Green
-Write-Host "      登錄路徑：$RegKey" -ForegroundColor Gray
+    if ($BlobChanged) {
+        Write-Host "      [OK] 憑證已寫入 GPO 登錄設定" -ForegroundColor Green
+    } else {
+        Write-Host "      [SKIP] GPO 登錄值已符合目標，未重複寫入" -ForegroundColor DarkGray
+    }
+    Write-Host "      登錄路徑：$RegKey" -ForegroundColor Gray
+}
+catch {
+    Write-Host "      [ERROR] 寫入 GPO 登錄值失敗：$($_.Exception.Message)" -ForegroundColor Red
+    throw
+}
 #endregion
 
 #region ── Step 3：連結 GPO 至網域根層級 ─────────────────────

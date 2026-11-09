@@ -36,5 +36,25 @@ function Merge-CAConfig {
         }
     }
 
+    # 重要：擋掉未實際填寫的佔位字串，避免腳本在後段才發現憑證設定錯誤。
+    $PlaceholderPatterns = @(
+        'YOUR_CERTIFICATE_THUMBPRINT_HERE',
+        'REPLACE_WITH_REAL_THUMBPRINT',
+        '<thumbprint>',
+        '0000000000000000000000000000000000000000'
+    )
+
+    if ($Merged.ContainsKey('CertificateThumbprint')) {
+        $Thumbprint = [string]$Merged['CertificateThumbprint']
+        if ([string]::IsNullOrWhiteSpace($Thumbprint)) {
+            throw "CAConfig.psd1 的 CertificateThumbprint 為空白，請先填入 DSC 加密憑證指紋後再執行。"
+        }
+
+        $PlaceholderHit = $PlaceholderPatterns | Where-Object { $Thumbprint -like "*$_*" } | Select-Object -First 1
+        if ($PlaceholderHit) {
+            throw "CAConfig.psd1 的 CertificateThumbprint 尚未實際設定（目前值：$Thumbprint）。請先替換為實際憑證指紋，再執行此腳本。"
+        }
+    }
+
     return $Merged
 }

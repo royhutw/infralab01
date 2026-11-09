@@ -75,8 +75,8 @@ foreach ($CompName in $Params.ServerComputerNames) {
         }
     }
     catch {
-        Write-Host "      [ERROR] 找不到或無法移動電腦帳號 $CompName ：$($_.Exception.Message)" -ForegroundColor Red
-        exit 1
+        Write-Host "      [WARNING] 找不到或無法移動電腦帳號 $CompName，已略過：$($_.Exception.Message)" -ForegroundColor Yellow
+        continue
     }
 }
 
@@ -172,7 +172,15 @@ try {
     )
 
     foreach ($CompName in $Params.ServerComputerNames) {
-        $CompObj = Get-ADComputer -Identity $CompName -ErrorAction Stop
+        $CompObj = Get-ADComputer -Identity $CompName -Properties 'msDS-AllowedToDelegateTo' -ErrorAction Stop
+        $CurrentAllowedSPNs = @($CompObj.'msDS-AllowedToDelegateTo' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+        $CurrentNormalized = @($CurrentAllowedSPNs | Sort-Object -Unique)
+        $DesiredNormalized = @($AllowedSPNs | Sort-Object -Unique)
+
+        if ((Compare-Object -ReferenceObject $CurrentNormalized -DifferenceObject $DesiredNormalized -SyncWindow 0).Count -eq 0) {
+            Write-Host "      [SKIP] $CompName 已具備目標 Kerberos 限制委派設定" -ForegroundColor DarkGray
+            continue
+        }
 
         $DelegateParams = @{
             Identity             = $CompObj.DistinguishedName

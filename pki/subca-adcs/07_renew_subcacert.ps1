@@ -41,6 +41,41 @@ $Params.CADistinguishedNameSuffix = $null
 $Params.CSROutputPath = $Params.RenewalCSROutputPath
 #endregion
 
+function Get-CurrentSubCACertThumbprints {
+    $CertutilOutput = certutil -store My 2>$null
+    $Thumbprints = @()
+    $CurrentThumbprint = $null
+    $IsSubCA = $false
+
+    foreach ($Line in $CertutilOutput) {
+        if ($Line -match 'Cert Hash\(sha1\):\s+(.+)') {
+            $CurrentThumbprint = $Matches[1].Trim()
+        }
+        if ($Line -match "Subject:.*$($Params.CACommonName)") {
+            $IsSubCA = $true
+        }
+        if ($IsSubCA -and $CurrentThumbprint) {
+            $Thumbprints += $CurrentThumbprint
+            $CurrentThumbprint = $null
+            $IsSubCA = $false
+        }
+    }
+
+    return ($Thumbprints | Select-Object -Unique)
+}
+
+function Test-CertKeyContainerExists {
+    param(
+        [string]$ContainerName
+    )
+
+    $KeyOutput = certutil -csp "Microsoft Software Key Storage Provider" -key 2>$null
+    if ($KeyOutput -match [regex]::Escape($ContainerName)) {
+        return $true
+    }
+    return $false
+}
+
 # ── 取得時間戳記（用於備份檔名）─────────────────────────────
 $Timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
 
@@ -158,57 +193,76 @@ Write-Host ""
 Write-Host "[3/7] 清除舊的憑證與金鑰..." -ForegroundColor Yellow
 
 # 移除 Personal 憑證存放區中的舊 SubCA 憑證（含封存）
-$ThumbprintsToRemove = @()
-
-# 用 certutil 列出含封存的憑證
-$CertutilOutput = certutil -store My 2>$null
-$CurrentThumbprint = $null
-$IsSubCA = $false
-
-foreach ($Line in $CertutilOutput) {
-    if ($Line -match 'Cert Hash\(sha1\):\s+(.+)') {
-        $CurrentThumbprint = $Matches[1].Trim()
+$ThumbprintsToRemove = @(Get-CurrentSubCACertThumbprints)
+if ($ThumbprintsToRemove.Count -gt 0) {
+    foreach ($Tp in $ThumbprintsToRemove) {
+        Write-Host "      移除憑證：$Tp" -ForegroundColor Gray
+        certutil -delstore My $Tp 2>$null | Out-Null
     }
-    if ($Line -match "Subject:.*$($Params.CACommonName)") {
-        $IsSubCA = $true
-    }
-    if ($IsSubCA -and $CurrentThumbprint) {
-        $ThumbprintsToRemove += $CurrentThumbprint
-        $CurrentThumbprint = $null
-        $IsSubCA = $false
-    }
+} else {
+    Write-Host "      [SKIP] 本機憑證存放區中未找到 $($Params.CACommonName) 的現有憑證" -ForegroundColor DarkGray
 }
 
-foreach ($Tp in ($ThumbprintsToRemove | Select-Object -Unique)) {
-    Write-Host "      移除憑證：$Tp" -ForegroundColor Gray
-    certutil -delstore My $Tp 2>$null | Out-Null
+# 移除金鑰容器（僅在存在時才清除）
+if (Test-CertKeyContainerExists -ContainerName $Params.CACommonName) {
+    Write-Host "      移除金鑰容器：$($Params.CACommonName)" -ForegroundColor Gray
+    certutil -delkey -csp "Microsoft Software Key Storage Provider" `
+        $Params.CACommonName 2>$null | Out-Null
+} else {
+    Write-Host "      [SKIP] 金鑰容器未找到：$($Params.CACommonName)" -ForegroundColor DarkGray
 }
 
-# 移除金鑰容器
-Write-Host "      移除金鑰容器：$($Params.CACommonName)" -ForegroundColor Gray
-certutil -delkey -csp "Microsoft Software Key Storage Provider" `
-    $Params.CACommonName 2>$null | Out-Null
+# 清除 CertEnroll 目錄（僅在有檔案時才清理）
+$CertEnrollPath = 'C:\Windows\System32\CertSrv\CertEnroll'
+if (Test-Path $CertEnrollPath) {
+    $ExistingEnrollFiles = Get-ChildItem $CertEnrollPath -ErrorAction SilentlyContinue
+    if ($ExistingEnrollFiles.Count -gt 0) {
+        Remove-Item "$CertEnrollPath\*" -Force -Recurse -ErrorAction SilentlyContinue
+        Write-Host "      [OK] 已清理 CertEnroll 目錄內容" -ForegroundColor Green
+    } else {
+        Write-Host "      [SKIP] CertEnroll 目錄已是空的" -ForegroundColor DarkGray
+    }
+} else {
+    Write-Host "      [SKIP] CertEnroll 目錄不存在，略過清理" -ForegroundColor DarkGray
+}
 
-# 清除 CertEnroll 目錄
-Remove-Item 'C:\Windows\System32\CertSrv\CertEnroll\*' `
-    -Force -Recurse -ErrorAction SilentlyContinue
-
-# 移除 AD DS 殘留物件
+# 移除 AD DS 殘留物件（僅在存在時才清除）
 Write-Host "      清除 AD DS 殘留物件..." -ForegroundColor Gray
 $ConfigDN = ($Params.DomainName.Split('.') | ForEach-Object { "DC=$_" }) -join ','
 $CAName   = $Params.CACommonName
 
-@(
+$ADCleanupTargets = @(
     "CN=$CAName,CN=Enrollment Services,CN=Public Key Services,CN=Services,CN=Configuration,$ConfigDN",
     "CN=$CAName,CN=AIA,CN=Public Key Services,CN=Services,CN=Configuration,$ConfigDN",
     "CN=$CAName,CN=CDP,CN=Public Key Services,CN=Services,CN=Configuration,$ConfigDN"
-) | ForEach-Object {
-    certutil -dspublish -delstore $_ 2>$null | Out-Null
+)
+
+foreach ($Target in $ADCleanupTargets) {
+    $Exists = $false
+    try {
+        $Exists = $null -ne (Get-ADObject -LDAPFilter "(distinguishedName=$Target)" -ErrorAction Stop)
+    }
+    catch {
+        $Exists = $false
+    }
+
+    if ($Exists) {
+        certutil -dspublish -delstore $Target 2>$null | Out-Null
+        Write-Host "      [OK] 已清除 AD 物件：$Target" -ForegroundColor Green
+    } else {
+        Write-Host "      [SKIP] AD 物件不存在：$Target" -ForegroundColor DarkGray
+    }
 }
 
-# Uninstall CA 設定
+# Uninstall CA 設定（僅在 role 已安裝時才移除）
 Write-Host "      移除 CA 設定..." -ForegroundColor Gray
-Uninstall-AdcsCertificationAuthority -Force -ErrorAction SilentlyContinue | Out-Null
+$CAFeature = Get-WindowsFeature -Name 'ADCS-Cert-Authority' -ErrorAction SilentlyContinue
+if ($CAFeature -and $CAFeature.Installed) {
+    Uninstall-AdcsCertificationAuthority -Force -ErrorAction SilentlyContinue | Out-Null
+    Write-Host "      [OK] 已移除 CA 角色設定" -ForegroundColor Green
+} else {
+    Write-Host "      [SKIP] CA 角色尚未安裝，未執行卸載" -ForegroundColor DarkGray
+}
 
 Write-Host "      [OK] 清除完成。" -ForegroundColor Green
 #endregion

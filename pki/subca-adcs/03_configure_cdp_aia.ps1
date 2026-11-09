@@ -27,6 +27,74 @@ Write-Host "  設定 CDP / AIA 延伸模組"                          -Foregroun
 Write-Host "=================================================="  -ForegroundColor Cyan
 Write-Host ""
 
+function Invoke-CertutilWithCheck {
+    param(
+        [Parameter(Mandatory)]
+        [string[]] $Arguments,
+
+        [Parameter(Mandatory)]
+        [string] $ActionDescription
+    )
+
+    $Output = & certutil @Arguments 2>&1
+    $ExitCode = $LASTEXITCODE
+
+    if ($ExitCode -ne 0) {
+        Write-Host "      [ERROR] $ActionDescription 失敗（退出碼：$ExitCode）" -ForegroundColor Red
+        if ($Output) {
+            $Output | ForEach-Object { Write-Host "      $_" -ForegroundColor Red }
+        }
+        throw "certutil $($Arguments -join ' ') 執行失敗。"
+    }
+
+    return $Output
+}
+
+function Normalize-CertutilRegistryValue {
+    param(
+        [AllowNull()]
+        [string] $Value
+    )
+
+    if ($null -eq $Value) {
+        return ''
+    }
+
+    return ($Value -replace "`r`n|`n|`r", ' ' -replace '\s+', ' ').Trim()
+}
+
+function Set-CertutilRegistryIfNeeded {
+    param(
+        [Parameter(Mandatory)]
+        [string] $RegistryName,
+
+        [Parameter(Mandatory)]
+        [string] $ExpectedValue,
+
+        [Parameter(Mandatory)]
+        [string] $ActionDescription
+    )
+
+    $CurrentOutput = & certutil -getreg $RegistryName 2>&1
+    $CurrentValue = ''
+
+    if ($LASTEXITCODE -eq 0) {
+        $CurrentValue = ($CurrentOutput | Out-String)
+        $CurrentValue = $CurrentValue -replace '.*?=\s*', ''
+    }
+
+    $CurrentNormalized = Normalize-CertutilRegistryValue -Value $CurrentValue
+    $ExpectedNormalized = Normalize-CertutilRegistryValue -Value $ExpectedValue
+
+    if ($CurrentNormalized -and $CurrentNormalized -eq $ExpectedNormalized) {
+        Write-Host "      [SKIP] $ActionDescription 已符合設定，未重寫。" -ForegroundColor DarkGray
+        return
+    }
+
+    Invoke-CertutilWithCheck -Arguments @('-setreg', $RegistryName, $ExpectedValue) -ActionDescription $ActionDescription | Out-Null
+    Write-Host "      [OK] $ActionDescription 已更新。" -ForegroundColor Green
+}
+
 # ── 確認 CertSvc 服務已啟動 ──────────────────────────────────
 $SvcStatus = (Get-Service CertSvc -ErrorAction SilentlyContinue).Status
 if ($SvcStatus -ne 'Running') {
@@ -53,6 +121,8 @@ if ([string]::IsNullOrWhiteSpace($CAConfig)) {
 Write-Host "[INFO] CA Config：$CAConfig" -ForegroundColor Gray
 Write-Host ""
 
+New-Item -Path $Params.CRLPublishPath -ItemType Directory -Force | Out-Null
+
 # ── Step 1：設定 CDP 延伸模組 ────────────────────────────────
 Write-Host "[1/5] 設定 CDP 延伸模組..." -ForegroundColor Yellow
 #
@@ -76,7 +146,7 @@ $CDPList = @(
     "2:$($Params.CDPHttpUrl)/%3%8%9.crl"
 )
 
-certutil -setreg CA\CRLPublicationURLs ($CDPList -join '\n') | Out-Null
+Set-CertutilRegistryIfNeeded -RegistryName 'CA\CRLPublicationURLs' -ExpectedValue ($CDPList -join '\n') -ActionDescription '設定 CDP 延伸模組'
 Write-Host "      CDP 設定完成：" -ForegroundColor Gray
 $CDPList | ForEach-Object { Write-Host "      $_" -ForegroundColor Gray }
 
@@ -93,7 +163,7 @@ $AIAList = @(
     "2:$($Params.AIAHttpUrl)/%1_%3%4.crt"
 )
 
-certutil -setreg CA\CACertPublicationURLs ($AIAList -join '\n') | Out-Null
+Set-CertutilRegistryIfNeeded -RegistryName 'CA\CACertPublicationURLs' -ExpectedValue ($AIAList -join '\n') -ActionDescription '設定 AIA 延伸模組'
 Write-Host "      AIA 設定完成：" -ForegroundColor Gray
 $AIAList | ForEach-Object { Write-Host "      $_" -ForegroundColor Gray }
 
@@ -101,12 +171,12 @@ $AIAList | ForEach-Object { Write-Host "      $_" -ForegroundColor Gray }
 Write-Host ""
 Write-Host "[3/5] 設定 CRL 更新週期..." -ForegroundColor Yellow
 
-certutil -setreg CA\CRLPeriodUnits  $Params.CRLPeriodUnits  | Out-Null
-certutil -setreg CA\CRLPeriod       $Params.CRLPeriod        | Out-Null
-certutil -setreg CA\CRLOverlapUnits  $Params.CRLOverlapUnits  | Out-Null
-certutil -setreg CA\CRLOverlapPeriod $Params.CRLOverlapPeriod | Out-Null
-certutil -setreg CA\CRLDeltaPeriodUnits $Params.CRLDeltaPeriodUnits | Out-Null
-certutil -setreg CA\CRLDeltaPeriod      $Params.CRLDeltaPeriod      | Out-Null
+Set-CertutilRegistryIfNeeded -RegistryName 'CA\CRLPeriodUnits' -ExpectedValue ([string]$Params.CRLPeriodUnits) -ActionDescription '設定 CRLPeriodUnits'
+Set-CertutilRegistryIfNeeded -RegistryName 'CA\CRLPeriod' -ExpectedValue ([string]$Params.CRLPeriod) -ActionDescription '設定 CRLPeriod'
+Set-CertutilRegistryIfNeeded -RegistryName 'CA\CRLOverlapUnits' -ExpectedValue ([string]$Params.CRLOverlapUnits) -ActionDescription '設定 CRLOverlapUnits'
+Set-CertutilRegistryIfNeeded -RegistryName 'CA\CRLOverlapPeriod' -ExpectedValue ([string]$Params.CRLOverlapPeriod) -ActionDescription '設定 CRLOverlapPeriod'
+Set-CertutilRegistryIfNeeded -RegistryName 'CA\CRLDeltaPeriodUnits' -ExpectedValue ([string]$Params.CRLDeltaPeriodUnits) -ActionDescription '設定 CRLDeltaPeriodUnits'
+Set-CertutilRegistryIfNeeded -RegistryName 'CA\CRLDeltaPeriod' -ExpectedValue ([string]$Params.CRLDeltaPeriod) -ActionDescription '設定 CRLDeltaPeriod'
 
 Write-Host "      CRL 有效期  ：$($Params.CRLPeriodUnits) $($Params.CRLPeriod)" -ForegroundColor Gray
 Write-Host "      Delta CRL   ：$($Params.CRLDeltaPeriodUnits) $($Params.CRLDeltaPeriod)" -ForegroundColor Gray
@@ -115,8 +185,8 @@ Write-Host "      重疊緩衝期  ：$($Params.CRLOverlapUnits) $($Params.CRLOv
 # ── Step 4：設定 CA 簽發憑證的最大有效期 ─────────────────────
 Write-Host ""
 Write-Host "[4/5] 設定 CA 憑證最大有效期（$($Params.ValidityPeriodUnits) $($Params.ValidityPeriod)）..." -ForegroundColor Yellow
-certutil -setreg CA\ValidityPeriodUnits $Params.ValidityPeriodUnits | Out-Null
-certutil -setreg CA\ValidityPeriod      $Params.ValidityPeriod      | Out-Null
+Set-CertutilRegistryIfNeeded -RegistryName 'CA\ValidityPeriodUnits' -ExpectedValue ([string]$Params.ValidityPeriodUnits) -ActionDescription '設定 ValidityPeriodUnits'
+Set-CertutilRegistryIfNeeded -RegistryName 'CA\ValidityPeriod' -ExpectedValue ([string]$Params.ValidityPeriod) -ActionDescription '設定 ValidityPeriod'
 Write-Host "      [OK]" -ForegroundColor Green
 
 # ── Step 5：重啟 CA 服務並立即發布新 CRL ─────────────────────
@@ -125,7 +195,7 @@ Write-Host "[5/5] 重啟 CA 服務並發布初始 CRL..." -ForegroundColor Yello
 Restart-Service CertSvc -Force
 Start-Sleep -Seconds 5
 
-certutil -crl | Out-Null
+Invoke-CertutilWithCheck -Arguments @('-crl') -ActionDescription '立即發布 CRL' | Out-Null
 Write-Host "      [OK] CRL 已發布至：$($Params.CRLPublishPath)" -ForegroundColor Green
 
 # ── 驗證 CDP/AIA 設定 ────────────────────────────────────────
