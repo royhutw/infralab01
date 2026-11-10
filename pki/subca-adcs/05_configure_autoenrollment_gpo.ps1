@@ -20,17 +20,17 @@
 #       實際程式碼行為本身正確（連結至網域根層級，涵蓋所有電腦與
 #       使用者），僅註解用詞不準確，已修正說明文字，避免誤導。
 #    2. 補充說明：本電腦 GPO 雖套用至整個網域（含所有電腦），但
-#       EAP-TLS-NPS-Server 範本的實際核發範圍，已在
-#       04_create_templates.ps1 v3 中改為僅授權 NPS-Servers 專屬
-#       群組，因此即使本 GPO 全域啟用電腦 Auto-Enrollment，非 NPS
-#       伺服器的電腦仍會因為範本 ACL 權限不足，無法申請到
-#       EAP-TLS-NPS-Server 憑證（僅會嘗試但遭 CA 拒絕，不影響其
-#       正常申請 EAP-TLS-Computer 憑證）。請確保先執行更新後的
-#       04 腳本，再執行本腳本。
+#       EAP-TLS-NPS-Server 範本的實際核發範圍，已在 04_create_templates.ps1
+#       改為僅授權 NPS-Servers 專屬群組；Auto-Enrollment 只處理電腦
+#       具有 Enroll/Autoenroll 權限的範本，其餘電腦不會申請該範本。
+#       請確保先執行 04 腳本，再執行本腳本。
 # ============================================================
 
+#requires -Version 5.1
+#requires -RunAsAdministrator
+
 #region ── 參數區（統一從 CAConfig.psd1 讀取，請至該檔案修改參數）──
-# 本腳本用到的區塊：Global（網域名稱/DN）、AutoEnrollGPO（GPO名稱）
+# 本腳本用到的區塊：Global（網域名稱/DN/記錄目錄）、AutoEnrollGPO（GPO名稱）
 . (Join-Path $PSScriptRoot 'Import-CAConfig.ps1')
 $Params = Merge-CAConfig -Sections 'Global','AutoEnrollGPO'
 
@@ -43,40 +43,20 @@ $Params.ComputerGPOTarget = $Params.DomainDN
 $Params.UserGPOTarget     = $Params.DomainDN
 #endregion
 
-function Set-GPRegistryValueIfNeeded {
-    param(
-        [Parameter(Mandatory = $true)][string]$GpoName,
-        [Parameter(Mandatory = $true)][string]$Key,
-        [Parameter(Mandatory = $true)][string]$ValueName,
-        [Parameter(Mandatory = $true)][string]$Type,
-        [Parameter(Mandatory = $true)]$Value
-    )
-
-    $CurrentValue = Get-GPRegistryValue -Name $GpoName -Key $Key -ValueName $ValueName -ErrorAction SilentlyContinue
-    if ($null -ne $CurrentValue) {
-        $CurrentNormalized = switch ($Type) {
-            'DWord' { [int]$CurrentValue.Value }
-            'Binary' { if ($CurrentValue.Value -is [byte[]]) { ($CurrentValue.Value | ForEach-Object { $_.ToString('X2') }) -join '' } else { [string]$CurrentValue.Value } }
-            default { [string]$CurrentValue.Value }
-        }
-
-        $DesiredNormalized = switch ($Type) {
-            'DWord' { [int]$Value }
-            'Binary' { if ($Value -is [byte[]]) { ($Value | ForEach-Object { $_.ToString('X2') }) -join '' } else { [string]$Value } }
-            default { [string]$Value }
-        }
-
-        if ($CurrentNormalized -eq $DesiredNormalized) {
-            return $false
-        }
-    }
-
-    Set-GPRegistryValue -Name $GpoName -Key $Key -ValueName $ValueName -Type $Type -Value $Value | Out-Null
-    return $true
+$ErrorActionPreference = 'Stop'
+$LogFile = Start-CATranscript -Name '05_configure_autoenrollment_gpo' -Params $Params
+trap {
+    Write-Host ""
+    Write-Host "[ERROR] $($_.Exception.Message)" -ForegroundColor Red
+    Write-Host "        詳細記錄：$LogFile" -ForegroundColor Red
+    Stop-CATranscript
+    exit 1
 }
 
-Install-WindowsFeature GPMC -ErrorAction Stop | Out-Null
-Import-Module GroupPolicy -ErrorAction Stop
+# Set-GPRegistryValueIfNeeded 已移至共用的 Import-CAConfig.ps1
+
+Install-WindowsFeature GPMC | Out-Null
+Import-Module GroupPolicy
 
 Write-Host ""
 Write-Host "=================================================="  -ForegroundColor Cyan
@@ -91,11 +71,11 @@ Write-Host "=================================================="  -ForegroundColo
 #    HKLM\SOFTWARE\Policies\Microsoft\Cryptography\AutoEnrollment
 #    值名稱：AEPolicy（DWORD）
 #
-#  AEPolicy 旗標說明：
-#    0 = 停用 Auto-Enrollment
-#    1 = 啟用 Auto-Enrollment（僅自動申請）
-#    7 = 啟用 Auto-Enrollment + 自動更新 + 移除已撤銷憑證（建議值）
-#      = 0x1（啟用）| 0x2（更新到期憑證）| 0x4（移除撤銷/到期憑證）
+#  AEPolicy 值說明：
+#    7      = 啟用，並勾選「更新到期憑證、更新待處理憑證、移除已撤銷憑證」
+#             與「更新使用憑證範本的憑證」（GPO 介面常見的建議組合）
+#    0      = 啟用，但未勾選任何選項（並非停用）
+#    0x8000 = 停用 Auto-Enrollment
 #
 #  （AEPolicy=7 已核對多份微軟與社群技術文件，確認為標準建議值，
 #   本次審查未發現此設定有誤，維持原樣）
@@ -198,9 +178,10 @@ if ($null -eq $ExistingUserLink) {
 # ── 產生 GPO 報告（HTML）────────────────────────────────────
 Write-Host ""
 Write-Host "[報告] 產生 GPO 設定報告..." -ForegroundColor Yellow
-Get-GPOReport -Name $Params.ComputerGPOName -ReportType Html -Path '.\GPO_Computer_AutoEnroll.html' -Domain $Params.DomainName
-Get-GPOReport -Name $Params.UserGPOName     -ReportType Html -Path '.\GPO_User_AutoEnroll.html'     -Domain $Params.DomainName
-Write-Host "      [OK] 報告已輸出至目前目錄" -ForegroundColor Green
+$ReportDir = Join-Path $Params.CAConfigDir 'Logs'
+Get-GPOReport -Name $Params.ComputerGPOName -ReportType Html -Path (Join-Path $ReportDir 'GPO_Computer_AutoEnroll.html') -Domain $Params.DomainName
+Get-GPOReport -Name $Params.UserGPOName     -ReportType Html -Path (Join-Path $ReportDir 'GPO_User_AutoEnroll.html')     -Domain $Params.DomainName
+Write-Host "      [OK] 報告已輸出至：$ReportDir" -ForegroundColor Green
 
 Write-Host @"
 
@@ -212,9 +193,8 @@ Write-Host @"
       AEPolicy = 7（啟用 + 自動更新 + 清理）
       連結範圍：網域根層級（所有加入網域的電腦）
       憑證範本：EAP-TLS-Computer（1年，Domain Computers 皆可申請）
-      註：本 GPO 也會讓所有電腦嘗試申請 EAP-TLS-NPS-Server，
-          但該範本 ACL 已限縮僅 NPS-Servers 群組成員可成功取得，
-          其餘電腦嘗試會被 CA 拒絕，屬預期行為，不影響運作。
+      註：Auto-Enrollment 只會處理該電腦「具有 Enroll/Autoenroll 權限」的範本；
+          EAP-TLS-NPS-Server 的 ACL 僅授權 NPS-Servers 群組，其餘電腦不會申請。
 
     使用者 GPO：$($Params.UserGPOName)
       AEPolicy = 7（啟用 + 自動更新 + 清理）
@@ -237,3 +217,5 @@ Write-Host @"
         或手動執行 gpupdate /force 才會立即申請憑證。
 ==================================================
 "@ -ForegroundColor Green
+
+Stop-CATranscript

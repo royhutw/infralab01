@@ -1,469 +1,222 @@
 ﻿# ============================================================
 #  07_renew_subcacert.ps1
-#  （修正：原檔頭誤標為「06_renew_subcacert.ps1」，與實際檔名
-#    07_renew_subcacert.ps1 不符，已修正編號，避免與
-#    06_Deploy-RootCACert.ps1 搞混）
+#  Subordinate CA 憑證更新（產生「新金鑰」的更新 CSR）
 #
-#  Subordinate CA 憑證 Renewal 腳本
-#  每次 Renewal 產生全新 Private Key 與 CSR
+#  作法：以 certutil -renewcert（不加 ReuseKeys）在「執行中的 CA」上產生新金鑰對與更新 CSR。
+#    - 不會移除 CA 角色、不會刪除資料庫、不會刪除舊金鑰、不會刪除 AD 物件。
+#      舊金鑰仍用來簽署「舊 CA 憑證時期已簽發憑證」的 CRL；刪除它會使這些憑證無法撤銷。
+#    - CA 持續以舊憑證運作，直到新憑證安裝完成才切換（無停機）。
+#    - 新金鑰長度由 %windir%\CAPolicy.inf 的 [certsrv_server] RenewalKeyLength 決定
+#      （預設 2048，與 01 安裝時的 4096 不同），本腳本會依 CAConfig.psd1 的
+#      ADCSInstall.KeyLength 寫入並在產生後驗證。
 #
-#  執行時機：
-#    - Subordinate CA 憑證即將到期前
-#    - 需要更換 CDP/AIA URL 時
-#    - 主動汰換金鑰時（安全考量）
+#  執行時機：Sub CA 憑證即將到期、需更換 CDP/AIA URL、或主動汰換金鑰時。
 #
-#  執行流程：
-#    1. 停止 CA 服務
-#    2. 備份現有憑證與設定
-#    3. 清除舊的憑證與金鑰
-#    4. 重新安裝 CA 角色設定（產生新 Private Key 與 CSR）
-#    5. 提示將 CSR 帶到 Root CA 簽發
+#  更新流程：
+#    1. 07（本腳本）  備份 CA（含私鑰與資料庫）→ 產生 SubCA_renewal.req
+#    2. Root CA       簽發更新憑證（見 README「七、Sub CA 憑證更新」）
+#    3. 02 -Renewal   安裝 SubCA_renewal.crt、重啟 CertSvc、發布新 CRL
+#
+#  需求：以系統管理員身分在 Sub CA 上執行。
 # ============================================================
+#requires -Version 5.1
+#requires -RunAsAdministrator
+
+[CmdletBinding()]
+param(
+    # 已自行完成 certutil -backup（含私鑰）時可略過備份步驟；不建議
+    [switch] $SkipBackup
+)
 
 #region ── 參數區（統一從 CAConfig.psd1 讀取，請至該檔案修改參數）──
-# 本腳本用到的區塊：Global（CA名稱/網域）、
-# RootCADN（DN欄位，與01共用同一份，需與Root CA一致）、
-# ADCSInstall（金鑰設定，與01共用同一份）、
-# DSCCredential（DSC Credential加密憑證，與01共用同一份）、
-# SubCARenewal（Renewal 專屬的 CSR 輸出路徑／備份目錄）
-#
-# 【變數命名統一】原本此腳本使用 $RenewalParams，其餘腳本一律
-# 使用 $Params，本次一併統一命名，降低跨腳本閱讀時的認知負擔。
+# 本腳本用到的區塊：Global（CA 名稱 / 記錄目錄）、ExchangePaths（Root CA CRL 路徑，僅用於提示）、
+# ADCSInstall（金鑰長度，與 01 共用）、SubCARenewal（更新 CSR 輸出路徑 / 備份目錄）
 . (Join-Path $PSScriptRoot 'Import-CAConfig.ps1')
-$Params = Merge-CAConfig -Sections 'Global','RootCADN','ADCSInstall','DSCCredential','SubCARenewal'
-
-# CADistinguishedNameSuffix 由下方自動組合，勿填寫
-$Params.CADistinguishedNameSuffix = $null
-
-# 沿用 SubCARenewal 區塊的 RenewalCSROutputPath 作為本腳本的
-# CSROutputPath（刻意用不同的 psd1 鍵名跟 01 的初次安裝 CSR 路徑
-# 區分，避免兩支腳本不小心輸出到同一個檔案互相覆蓋）
-$Params.CSROutputPath = $Params.RenewalCSROutputPath
+$Params = Merge-CAConfig -Sections 'Global','ExchangePaths','ADCSInstall','SubCARenewal'
 #endregion
 
-function Get-CurrentSubCACertThumbprints {
-    $CertutilOutput = certutil -store My 2>$null
-    $Thumbprints = @()
-    $CurrentThumbprint = $null
-    $IsSubCA = $false
-
-    foreach ($Line in $CertutilOutput) {
-        if ($Line -match 'Cert Hash\(sha1\):\s+(.+)') {
-            $CurrentThumbprint = $Matches[1].Trim()
-        }
-        if ($Line -match "Subject:.*$($Params.CACommonName)") {
-            $IsSubCA = $true
-        }
-        if ($IsSubCA -and $CurrentThumbprint) {
-            $Thumbprints += $CurrentThumbprint
-            $CurrentThumbprint = $null
-            $IsSubCA = $false
-        }
-    }
-
-    return ($Thumbprints | Select-Object -Unique)
-}
-
-function Test-CertKeyContainerExists {
-    param(
-        [string]$ContainerName
-    )
-
-    $KeyOutput = certutil -csp "Microsoft Software Key Storage Provider" -key 2>$null
-    if ($KeyOutput -match [regex]::Escape($ContainerName)) {
-        return $true
-    }
-    return $false
-}
-
-# ── 取得時間戳記（用於備份檔名）─────────────────────────────
+$ErrorActionPreference = 'Stop'
 $Timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+$LogFile = Start-CATranscript -Name '07_renew_subcacert' -Params $Params
+trap {
+    Write-Host ""
+    Write-Host "[ERROR] $($_.Exception.Message)" -ForegroundColor Red
+    Write-Host "        詳細記錄：$LogFile" -ForegroundColor Red
+    Stop-CATranscript
+    exit 1
+}
+
+#region ── 輔助函式 ──────────────────────────────────────────
+function Set-CAPolicyRenewalKeyLength {
+    <# 確保 %windir%\CAPolicy.inf 的 [certsrv_server] 含 RenewalKeyLength=<KeyLength>（原檔先備份） #>
+    param([Parameter(Mandatory)][int] $KeyLength)
+
+    $Path  = Join-Path $env:windir 'CAPolicy.inf'
+    $Lines = if (Test-Path -LiteralPath $Path) { @(Get-Content -LiteralPath $Path) } else { @() }
+    if ($Lines.Count -gt 0) { Copy-Item -LiteralPath $Path -Destination "$Path.bak_$Timestamp" }
+
+    $Out = New-Object System.Collections.Generic.List[string]
+    $InSection = $false; $Done = $false; $SectionSeen = $false
+    foreach ($Line in $Lines) {
+        if ($Line -match '^\s*\[(.+)\]\s*$') {
+            if ($InSection -and -not $Done) { $Out.Add("RenewalKeyLength=$KeyLength"); $Done = $true }
+            $InSection = ($Matches[1] -ieq 'certsrv_server')
+            if ($InSection) { $SectionSeen = $true }
+            $Out.Add($Line)
+            continue
+        }
+        if ($InSection -and $Line -match '^\s*RenewalKeyLength\s*=') {
+            if (-not $Done) { $Out.Add("RenewalKeyLength=$KeyLength"); $Done = $true }
+            continue
+        }
+        $Out.Add($Line)
+    }
+    if ($InSection -and -not $Done) { $Out.Add("RenewalKeyLength=$KeyLength"); $Done = $true }
+    if (-not $SectionSeen) { $Out.Add('[certsrv_server]'); $Out.Add("RenewalKeyLength=$KeyLength") }
+
+    Set-Content -LiteralPath $Path -Value $Out -Encoding ASCII
+    return $Path
+}
+#endregion
 
 Write-Host ""
 Write-Host "=================================================="  -ForegroundColor Cyan
-Write-Host "  Subordinate CA 憑證 Renewal"                      -ForegroundColor Cyan
+Write-Host "  Subordinate CA 憑證更新（新金鑰 CSR）"             -ForegroundColor Cyan
 Write-Host "  時間：$Timestamp"                                  -ForegroundColor Cyan
 Write-Host "=================================================="  -ForegroundColor Cyan
-Write-Host ""
-Write-Host "[方式] 產生全新 Private Key 與 CSR" -ForegroundColor Yellow
-Write-Host ""
-
-#region ── 互動式 Credential 輸入 ────────────────────────────
-Write-Host "[密碼輸入] Domain Admin Credential" -ForegroundColor Yellow
-Write-Host "  需要 Domain Admins 與 Enterprise Admins 群組成員資格" -ForegroundColor Gray
+Write-Host "  記錄檔：$LogFile" -ForegroundColor Gray
 Write-Host ""
 
-$DomainAdminCred = Get-Credential `
-    -UserName "$($Params.DomainName)\Administrator" `
-    -Message  '請輸入 Domain Administrator 帳號密碼（需具備 Enterprise Admins 權限）'
+# ── Step 0：前置檢查 ─────────────────────────────────────────
+Write-Host "[0/5] 前置檢查..." -ForegroundColor Yellow
 
-if ($null -eq $DomainAdminCred) {
-    Write-Host "[ERROR] 未輸入 Credential，作業中止。" -ForegroundColor Red
-    exit 1
+$CAConfig = Get-LocalCAConfigString
+$Svc = Get-Service -Name 'CertSvc' -ErrorAction SilentlyContinue
+if ($null -eq $Svc) { throw "找不到 CertSvc 服務，請確認此機器已安裝 AD CS。" }
+if ($Svc.Status -ne 'Running') { Start-Service -Name 'CertSvc' }
+if (-not (Wait-CertSvcReady)) { throw "CA 未回應 certutil -ping；更新必須在 CA 正常運作時進行，請先排除服務問題。" }
+Write-Host "      [OK] CA 運作中：$CAConfig" -ForegroundColor Green
+
+$CurrentCerts = @(Get-ChildItem Cert:\LocalMachine\My |
+    Where-Object { $_.Subject -like "CN=$($Params.CACommonName),*" -or $_.Subject -eq "CN=$($Params.CACommonName)" })
+foreach ($Cert in $CurrentCerts) {
+    Write-Host "      目前 CA 憑證：$($Cert.Thumbprint)  到期 $($Cert.NotAfter.ToString('yyyy-MM-dd'))  私鑰：$($Cert.HasPrivateKey)" -ForegroundColor Gray
 }
-#endregion
+if ($CurrentCerts.Count -eq 0) { Write-Host "      [WARN] LocalMachine\My 找不到 $($Params.CACommonName) 的憑證，請確認 CA 已完成 02。" -ForegroundColor Yellow }
 
-#region ── 自動組合 CADistinguishedNameSuffix ────────────────
-$DNParts = [System.Collections.Generic.List[string]]::new()
-
-# 必填欄位
-$DNParts.Add("O=$($Params.CAOrganization)")
-$DNParts.Add("C=$($Params.CACountry)")
-
-# 選填欄位（有值才加入）
-if (-not [string]::IsNullOrWhiteSpace($Params.CAOU)) {
-    $DNParts.Insert(1, "OU=$($Params.CAOU)")
-}
-if (-not [string]::IsNullOrWhiteSpace($Params.CALocality)) {
-    $DNParts.Add("L=$($Params.CALocality)")
-}
-if (-not [string]::IsNullOrWhiteSpace($Params.CAState)) {
-    $DNParts.Add("ST=$($Params.CAState)")
-}
-
-# 從 DomainName 自動拆解 DC= 鏈
-$DCParts = $Params.DomainName.Split('.') | ForEach-Object { "DC=$_" }
-$DNParts.AddRange([string[]]$DCParts)
-$Params.CADistinguishedNameSuffix = $DNParts -join ', '
-
-Write-Host "[DN] CSR 完整 DN 將為：" -ForegroundColor Gray
-Write-Host "     CN=$($Params.CACommonName), $($Params.CADistinguishedNameSuffix)" -ForegroundColor Gray
+# ── 執行確認 ─────────────────────────────────────────────────
 Write-Host ""
-#endregion
-
-#region ── 執行確認 ──────────────────────────────────────────
-Write-Host "=================================================="  -ForegroundColor Yellow
-Write-Host "  [警告] 此操作將執行以下動作："                    -ForegroundColor Yellow
-Write-Host "    1. 停止 CertSvc 服務"                           -ForegroundColor Yellow
-Write-Host "    2. 備份現有憑證至 $($Params.BackupPath)" -ForegroundColor Yellow
-Write-Host "    3. 移除現有 CA 憑證與金鑰（無法復原）"          -ForegroundColor Yellow
-Write-Host "    4. 產生全新 Private Key 與 CSR"                 -ForegroundColor Yellow
-Write-Host "    5. CA 服務將停止，直到新憑證安裝完成"           -ForegroundColor Yellow
-Write-Host "=================================================="  -ForegroundColor Yellow
-Write-Host ""
-$Confirm = Read-Host "確認繼續？(YES/N)"
-if ($Confirm -ne 'YES') {
+Write-Host "==================================================" -ForegroundColor Yellow
+Write-Host "  此操作將："                                       -ForegroundColor Yellow
+Write-Host "    1. 備份 CA（私鑰 + 資料庫）至 $($Params.BackupPath)" -ForegroundColor Yellow
+Write-Host "    2. 更新 $env:windir\CAPolicy.inf 的 RenewalKeyLength = $($Params.KeyLength)" -ForegroundColor Yellow
+Write-Host "    3. 以 certutil -renewcert 產生新金鑰與更新 CSR"  -ForegroundColor Yellow
+Write-Host "  CA 不會停止、舊金鑰與資料庫不會被刪除。"            -ForegroundColor Yellow
+Write-Host "==================================================" -ForegroundColor Yellow
+if ((Read-Host "確認繼續？(YES/N)") -ne 'YES') {
     Write-Host "[INFO] 作業取消。" -ForegroundColor Gray
+    Stop-CATranscript
     exit 0
 }
-#endregion
 
-#region ── Step 1：停止 CA 服務 ──────────────────────────────
+# ── Step 1：備份 CA ──────────────────────────────────────────
 Write-Host ""
-Write-Host "[1/7] 停止 CA 服務..." -ForegroundColor Yellow
-$SvcStatus = (Get-Service CertSvc -ErrorAction SilentlyContinue).Status
-if ($SvcStatus -eq 'Running') {
-    Stop-Service CertSvc -Force
-    Write-Host "      [OK] CertSvc 已停止。" -ForegroundColor Green
-} else {
-    Write-Host "      [INFO] CertSvc 已是停止狀態。" -ForegroundColor Gray
-}
-#endregion
-
-#region ── Step 2：備份現有憑證 ──────────────────────────────
-Write-Host ""
-Write-Host "[2/7] 備份現有憑證與金鑰資訊..." -ForegroundColor Yellow
-
-$BackupDir = "$($Params.BackupPath)\$Timestamp"
+Write-Host "[1/5] 備份 CA（私鑰 + 資料庫）..." -ForegroundColor Yellow
+$BackupDir = Join-Path $Params.BackupPath $Timestamp
 New-Item -Path $BackupDir -ItemType Directory -Force | Out-Null
 
-# 備份現有憑證（若存在）
-$ExistingCerts = Get-ChildItem Cert:\LocalMachine\My -ErrorAction SilentlyContinue |
-    Where-Object { $_.Subject -match $Params.CACommonName }
-
-if ($ExistingCerts) {
-    foreach ($Cert in $ExistingCerts) {
-        $CertFile = "$BackupDir\SubCA_$($Cert.Thumbprint).cer"
-        Export-Certificate -Cert $Cert -FilePath $CertFile | Out-Null
-        Write-Host "      [OK] 備份憑證：$CertFile" -ForegroundColor Green
-        Write-Host "           Thumbprint：$($Cert.Thumbprint)" -ForegroundColor Gray
-        Write-Host "           到期日    ：$($Cert.NotAfter)" -ForegroundColor Gray
-    }
+if ($SkipBackup) {
+    Write-Host "      [WARN] 已指定 -SkipBackup，略過 certutil -backup。" -ForegroundColor Yellow
 } else {
-    Write-Host "      [INFO] 找不到現有 SubCA 憑證（可能已清除）。" -ForegroundColor Gray
+    Write-Host "      certutil 會要求輸入保護私鑰的密碼（請妥善保管；備份含 CA 私鑰，需放置於安全位置）。" -ForegroundColor Gray
+    # 不擷取輸出，讓 certutil 能直接與使用者互動輸入密碼
+    & certutil -f -backup (Join-Path $BackupDir 'CABackup')
+    if ($LASTEXITCODE -ne 0) { throw "certutil -backup 失敗（退出碼：$LASTEXITCODE），已中止，未做任何變更。" }
+    Write-Host "      [OK] CA 備份完成：$BackupDir\CABackup" -ForegroundColor Green
 }
 
-# 備份 CertSrv 設定資訊
-certutil -getreg CA\ > "$BackupDir\CA_Registry_Backup.txt" 2>$null
-Write-Host "      [OK] CA 登錄設定已備份至：$BackupDir\CA_Registry_Backup.txt" -ForegroundColor Green
-#endregion
+# 一併保留登錄設定與現有 CA 憑證（便於稽核與還原）
+& certutil -getreg CA\ 2>&1 | Out-File -FilePath (Join-Path $BackupDir 'CA_Registry.txt') -Encoding UTF8
+foreach ($Cert in $CurrentCerts) {
+    Export-Certificate -Cert $Cert -FilePath (Join-Path $BackupDir "SubCA_$($Cert.Thumbprint).cer") | Out-Null
+}
+Write-Host "      [OK] 已保存登錄設定與現有 CA 憑證（公鑰）：$BackupDir" -ForegroundColor Green
 
-#region ── Step 3：清除舊憑證與金鑰 ─────────────────────────
+# ── Step 2：CAPolicy.inf 金鑰長度 ────────────────────────────
 Write-Host ""
-Write-Host "[3/7] 清除舊的憑證與金鑰..." -ForegroundColor Yellow
+Write-Host "[2/5] 設定新金鑰長度（CAPolicy.inf RenewalKeyLength）..." -ForegroundColor Yellow
+$PolicyPath = Set-CAPolicyRenewalKeyLength -KeyLength $Params.KeyLength
+Write-Host "      [OK] 已設定：$PolicyPath（RenewalKeyLength=$($Params.KeyLength)）" -ForegroundColor Green
 
-# 移除 Personal 憑證存放區中的舊 SubCA 憑證（含封存）
-$ThumbprintsToRemove = @(Get-CurrentSubCACertThumbprints)
-if ($ThumbprintsToRemove.Count -gt 0) {
-    foreach ($Tp in $ThumbprintsToRemove) {
-        Write-Host "      移除憑證：$Tp" -ForegroundColor Gray
-        certutil -delstore My $Tp 2>$null | Out-Null
-    }
-} else {
-    Write-Host "      [SKIP] 本機憑證存放區中未找到 $($Params.CACommonName) 的現有憑證" -ForegroundColor DarkGray
-}
-
-# 移除金鑰容器（僅在存在時才清除）
-if (Test-CertKeyContainerExists -ContainerName $Params.CACommonName) {
-    Write-Host "      移除金鑰容器：$($Params.CACommonName)" -ForegroundColor Gray
-    certutil -delkey -csp "Microsoft Software Key Storage Provider" `
-        $Params.CACommonName 2>$null | Out-Null
-} else {
-    Write-Host "      [SKIP] 金鑰容器未找到：$($Params.CACommonName)" -ForegroundColor DarkGray
-}
-
-# 清除 CertEnroll 目錄（僅在有檔案時才清理）
-$CertEnrollPath = 'C:\Windows\System32\CertSrv\CertEnroll'
-if (Test-Path $CertEnrollPath) {
-    $ExistingEnrollFiles = Get-ChildItem $CertEnrollPath -ErrorAction SilentlyContinue
-    if ($ExistingEnrollFiles.Count -gt 0) {
-        Remove-Item "$CertEnrollPath\*" -Force -Recurse -ErrorAction SilentlyContinue
-        Write-Host "      [OK] 已清理 CertEnroll 目錄內容" -ForegroundColor Green
-    } else {
-        Write-Host "      [SKIP] CertEnroll 目錄已是空的" -ForegroundColor DarkGray
-    }
-} else {
-    Write-Host "      [SKIP] CertEnroll 目錄不存在，略過清理" -ForegroundColor DarkGray
-}
-
-# 移除 AD DS 殘留物件（僅在存在時才清除）
-Write-Host "      清除 AD DS 殘留物件..." -ForegroundColor Gray
-$ConfigDN = ($Params.DomainName.Split('.') | ForEach-Object { "DC=$_" }) -join ','
-$CAName   = $Params.CACommonName
-
-$ADCleanupTargets = @(
-    "CN=$CAName,CN=Enrollment Services,CN=Public Key Services,CN=Services,CN=Configuration,$ConfigDN",
-    "CN=$CAName,CN=AIA,CN=Public Key Services,CN=Services,CN=Configuration,$ConfigDN",
-    "CN=$CAName,CN=CDP,CN=Public Key Services,CN=Services,CN=Configuration,$ConfigDN"
-)
-
-foreach ($Target in $ADCleanupTargets) {
-    $Exists = $false
-    try {
-        $Exists = $null -ne (Get-ADObject -LDAPFilter "(distinguishedName=$Target)" -ErrorAction Stop)
-    }
-    catch {
-        $Exists = $false
-    }
-
-    if ($Exists) {
-        certutil -dspublish -delstore $Target 2>$null | Out-Null
-        Write-Host "      [OK] 已清除 AD 物件：$Target" -ForegroundColor Green
-    } else {
-        Write-Host "      [SKIP] AD 物件不存在：$Target" -ForegroundColor DarkGray
-    }
-}
-
-# Uninstall CA 設定（僅在 role 已安裝時才移除）
-Write-Host "      移除 CA 設定..." -ForegroundColor Gray
-$CAFeature = Get-WindowsFeature -Name 'ADCS-Cert-Authority' -ErrorAction SilentlyContinue
-if ($CAFeature -and $CAFeature.Installed) {
-    Uninstall-AdcsCertificationAuthority -Force -ErrorAction SilentlyContinue | Out-Null
-    Write-Host "      [OK] 已移除 CA 角色設定" -ForegroundColor Green
-} else {
-    Write-Host "      [SKIP] CA 角色尚未安裝，未執行卸載" -ForegroundColor DarkGray
-}
-
-Write-Host "      [OK] 清除完成。" -ForegroundColor Green
-#endregion
-
-#region ── Step 4：確認清除結果 ──────────────────────────────
+# ── Step 3：產生新金鑰與更新 CSR ─────────────────────────────
 Write-Host ""
-Write-Host "[4/7] 確認清除結果..." -ForegroundColor Yellow
+Write-Host "[3/5] 產生新金鑰與更新 CSR（certutil -renewcert）..." -ForegroundColor Yellow
+$StartTime = Get-Date
+$Output    = & certutil -f -renewcert 2>&1
+$ExitCode  = $LASTEXITCODE
+$Output | ForEach-Object { Write-Host "      $_" -ForegroundColor Gray }
+if ($ExitCode -ne 0) { throw "certutil -renewcert 失敗（退出碼：$ExitCode）。CA 與舊金鑰未受影響。" }
 
-$StoreCheck = certutil -store My 2>$null | Select-String $Params.CACommonName
-if ($StoreCheck) {
-    Write-Host "      [WARN] 憑證存放區仍有殘留，請手動確認。" -ForegroundColor Yellow
+# 取得 CSR 檔案：優先從輸出解析路徑，否則在系統磁碟根目錄找本次新產生的 .req
+$CsrSource = $null
+$PathHit = ($Output | Out-String) | Select-String -Pattern '[A-Za-z]:\\[^\r\n"]*\.req' | Select-Object -First 1
+if ($PathHit -and (Test-Path -LiteralPath $PathHit.Matches[0].Value)) { $CsrSource = $PathHit.Matches[0].Value }
+if (-not $CsrSource) {
+    $CsrSource = Get-ChildItem -Path "$env:SystemDrive\" -Filter '*.req' -ErrorAction SilentlyContinue |
+        Where-Object { $_.LastWriteTime -ge $StartTime.AddSeconds(-5) } |
+        Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName
+}
+if (-not $CsrSource) { throw "找不到新產生的 CSR（.req）。請檢視上方 certutil 輸出，或在 $env:SystemDrive\ 下尋找 *.req。" }
+
+New-Item -Path (Split-Path $Params.RenewalCSROutputPath) -ItemType Directory -Force | Out-Null
+Copy-Item -LiteralPath $CsrSource -Destination $Params.RenewalCSROutputPath -Force
+Write-Host "      [OK] CSR：$($Params.RenewalCSROutputPath)（來源：$CsrSource）" -ForegroundColor Green
+
+# ── Step 4：驗證 CSR ─────────────────────────────────────────
+Write-Host ""
+Write-Host "[4/5] 驗證 CSR 內容..." -ForegroundColor Yellow
+$Dump = & certutil -dump $Params.RenewalCSROutputPath 2>&1 | Out-String
+$Dump -split "`r?`n" | Select-String -Pattern 'Subject|Public Key Length|Public Key Algorithm' | Select-Object -First 6 |
+    ForEach-Object { Write-Host "      $($_.Line.Trim())" -ForegroundColor Gray }
+
+if ($Dump -match 'Public Key Length:\s*(\d+)') {
+    if ([int]$Matches[1] -ne $Params.KeyLength) {
+        throw "新 CSR 的金鑰長度為 $($Matches[1])，與設定的 $($Params.KeyLength) 不符。請確認 CAPolicy.inf 後重新執行本腳本，再送交 Root CA 簽發。"
+    }
+    Write-Host "      [OK] 新金鑰長度：$($Matches[1]) bits" -ForegroundColor Green
 } else {
-    Write-Host "      [OK] 憑證存放區乾淨。" -ForegroundColor Green
+    Write-Host "      [WARN] 無法從 certutil -dump 解析金鑰長度，請人工確認為 $($Params.KeyLength) bits。" -ForegroundColor Yellow
 }
 
-$KeyCheck = certutil -csp "Microsoft Software Key Storage Provider" -key 2>$null |
-    Select-String $Params.CACommonName
-if ($KeyCheck) {
-    Write-Host "      [WARN] 金鑰容器仍有殘留，請手動確認。" -ForegroundColor Yellow
-} else {
-    Write-Host "      [OK] 金鑰容器乾淨。" -ForegroundColor Green
-}
-#endregion
-
-#region ── Step 5：產生新的 Private Key 與 CSR ───────────────
+# ── Step 5：後續步驟 ─────────────────────────────────────────
 Write-Host ""
-Write-Host "[5/7] 產生新的 Private Key 與 CSR..." -ForegroundColor Yellow
-
-# 設定 ConfigurationData（DSC Credential 加密用）
-$ConfigData = @{
-    AllNodes = @(
-        @{
-            NodeName                    = 'localhost'
-            PSDscAllowPlainTextPassword = $false
-            PSDscAllowDomainUser        = $true
-            CertificateFile             = $Params.CertificatePath
-            Thumbprint                  = $Params.CertificateThumbprint
-        }
-    )
-}
-
-# 定義 DSC 設定（僅 CA 安裝，不含其他角色）
-Configuration RenewSubCA {
-    param (
-        [Parameter(Mandatory)]
-        [string] $NodeName,
-        [Parameter(Mandatory)]
-        [PSCredential] $DomainAdminCredential
-    )
-
-    Import-DscResource -ModuleName 'PSDesiredStateConfiguration'
-    Import-DscResource -ModuleName 'ActiveDirectoryCSDsc'
-
-    Node $NodeName {
-        # 角色已安裝，此處確保 Present 狀態即可
-        WindowsFeature ADCS_CertAuthority {
-            Name   = 'ADCS-Cert-Authority'
-            Ensure = 'Present'
-        }
-
-        # 重新產生新的 Private Key 與 CSR
-        AdcsCertificationAuthority RenewSubCA {
-            Ensure                    = 'Present'
-            IsSingleInstance          = 'Yes'
-            CAType                    = 'EnterpriseSubordinateCA'
-            CACommonName              = $Params.CACommonName
-            CADistinguishedNameSuffix = $Params.CADistinguishedNameSuffix
-            KeyLength                 = $Params.KeyLength
-            HashAlgorithmName         = $Params.HashAlgorithm
-            CryptoProviderName        = 'RSA#Microsoft Software Key Storage Provider'
-            OutputCertRequestFile     = $Params.CSROutputPath
-            OverwriteExistingCAinDS   = $true   # Renewal 時允許覆寫 AD DS 物件
-            OverwriteExistingDatabase = $true   # Renewal 時允許覆寫資料庫
-            OverwriteExistingKey      = $true   # Renewal 時產生全新金鑰對
-            Credential                = $DomainAdminCredential
-            DependsOn                 = '[WindowsFeature]ADCS_CertAuthority'
-        }
-    }
-}
-
-# ── LCM 設定：告知 LCM 使用哪張憑證解密 Credential ─────────
-# 必須在套用主設定前先套用 LCM，否則 LCM 找不到解密憑證會報錯：
-# "The certificate cannot be found in the local machine certificate store."
-[DSCLocalConfigurationManager()]
-Configuration LCM_RenewConfig {
-    Node 'localhost' {
-        Settings {
-            RebootNodeIfNeeded             = $true
-            ActionAfterReboot              = 'ContinueConfiguration'
-            ConfigurationMode              = 'ApplyAndAutoCorrect'
-            ConfigurationModeFrequencyMins = 15
-            CertificateID                  = $Params.CertificateThumbprint
-        }
-    }
-}
-
-Write-Host "      編譯並套用 LCM 設定（憑證解密）..." -ForegroundColor Gray
-New-Item -Path '.\RenewSubCA_MOF\LCM'    -ItemType Directory -Force | Out-Null
-New-Item -Path '.\RenewSubCA_MOF\Config' -ItemType Directory -Force | Out-Null
-
-LCM_RenewConfig -OutputPath '.\RenewSubCA_MOF\LCM' | Out-Null
-Set-DscLocalConfigurationManager -Path '.\RenewSubCA_MOF\LCM' -Verbose
-
-# ── 編譯主設定 MOF ───────────────────────────────────────────
-Write-Host "      編譯 DSC 主設定..." -ForegroundColor Gray
-RenewSubCA `
-    -NodeName              'localhost' `
-    -DomainAdminCredential $DomainAdminCred `
-    -ConfigurationData     $ConfigData `
-    -OutputPath            '.\RenewSubCA_MOF\Config' | Out-Null
-
-# ── 套用 DSC ─────────────────────────────────────────────────
-Write-Host "      套用 DSC（產生新 Private Key 與 CSR）..." -ForegroundColor Gray
-Start-DscConfiguration -Path '.\RenewSubCA_MOF\Config' -Wait -Force `
-    -ErrorAction Stop
-#endregion
-
-#region ── Step 6：確認 CSR 產生成功 ─────────────────────────
-Write-Host ""
-Write-Host "[6/7] 確認 CSR 產生結果..." -ForegroundColor Yellow
-
-# 確認 CSR 檔案
-$CSRLocations = @(
-    $Params.CSROutputPath,
-    'C:\Windows\System32\CertSrv\CertEnroll\'
-)
-
-$CSRFound = $false
-foreach ($Location in $CSRLocations) {
-    if (Test-Path $Location) {
-        $CSRFiles = Get-ChildItem $Location -Filter '*.req' -ErrorAction SilentlyContinue
-        if ($CSRFiles) {
-            foreach ($CSR in $CSRFiles) {
-                Write-Host "      [OK] CSR 已產生：$($CSR.FullName)" -ForegroundColor Green
-                Write-Host "           大小：$($CSR.Length) bytes" -ForegroundColor Gray
-                Write-Host "           時間：$($CSR.LastWriteTime)" -ForegroundColor Gray
-            }
-            $CSRFound = $true
-        }
-    }
-}
-
-if (-not $CSRFound) {
-    Write-Host "      [ERROR] 找不到 CSR 檔案，請檢查 DSC 執行結果。" -ForegroundColor Red
-    Write-Host "              執行 Get-DscConfigurationStatus 查看詳細錯誤。" -ForegroundColor Red
-    exit 1
-}
-
-# 顯示新 CSR 的 Public Key 指紋（供確認用）
-Write-Host ""
-Write-Host "      [確認] 新 CSR 的 Public Key Hash：" -ForegroundColor Gray
-certutil -dump $Params.CSROutputPath 2>$null |
-    Select-String -Pattern 'Public Key Hash|Subject' |
-    ForEach-Object { Write-Host "      $_" -ForegroundColor Gray }
-#endregion
-
-#region ── Step 7：後續步驟提示 ──────────────────────────────
-Write-Host ""
-Write-Host "[7/7] 後續步驟提示..." -ForegroundColor Yellow
-
+Write-Host "[5/5] 後續步驟" -ForegroundColor Yellow
 Write-Host @"
 
 ==================================================
-  Subordinate CA Renewal CSR 產生完成！
+  更新 CSR 已產生，CA 仍以舊憑證正常運作。
 
-  新 CSR 位置：$($Params.CSROutputPath)
-  備份位置  ：$BackupDir
-
-  ─────────────────────────────────────────────
-  後續步驟：
+  更新 CSR：$($Params.RenewalCSROutputPath)
+  備份位置：$BackupDir（含 CA 私鑰，請移至安全位置保管）
 
   [Root CA VM]
-    1. 將新 CSR 複製到 Root CA VM：
-       C:\RootCA\requests\intermediateCA.csr
-
-    2. 若需要更新 CDP URL，先修改：
-       C:\RootCA\openssl-rootca.cnf
-       → [v3_intermediate_ca] crlDistributionPoints
-
-    3. 撤銷舊憑證（若仍有效）：
-       執行 04_revoke_cert.bat
-
-    4. 重新簽發新憑證：
-       執行 02_sign_intermediate.bat
-
-    5. 更新並發布 CRL：
-       執行 03_renew_crl.bat
+    1. 將更新 CSR 複製為 C:\RootCA\requests\intermediateCA.csr
+    2. 若需更換 CDP URL，先修改 ca-env.bat 的 CA_CRL_URL
+    3. 執行 02_sign_intermediate.bat 簽發更新憑證
+       ※ 不要撤銷舊的 Sub CA 憑證：它簽發的所有憑證都依賴它，撤銷會讓這些憑證全數失效。
+         若 Root CA 因 openssl 的 unique_subject = yes 拒絕簽發相同 Subject 的新憑證，
+         請在 Root CA 端處理該設定（見 rootca_openssl 目錄說明），而不是撤銷舊憑證；
+         撤銷僅限於舊金鑰外洩的情況。
+    4. 執行 03_renew_crl.bat（Root CA CRL 需保持有效）
 
   [AD CS 伺服器]
-    6. 將簽回的憑證複製到：
-       C:\CAConfig\SubCA_renewal.crt
-
-    7. 安裝新憑證：
-       執行 02_install_subcacert.ps1
-
-    8. 更新 CDP/AIA 設定（如有異動）：
-       執行 03_configure_cdp_aia.ps1
-
-  ─────────────────────────────────────────────
-  注意：CA 服務目前為停止狀態，
-        安裝新憑證後才會恢復正常運作。
+    5. 將簽回的憑證複製到：$($Params.RenewalSignedCertPath)
+       並更新 Root CA 的 CRL：$($Params.RootCACRLPath)（如有更新）
+    6. 執行  .\02_install_subcacert.ps1 -Renewal
+       （安裝新憑證、重啟 CertSvc、發布以新金鑰簽署的 CRL）
+    7. 確認 http://…/CRL 與 /AIA 目錄已出現新的 .crl / .crt（檔名含 (1) 等金鑰索引），
+       再執行 Publish-SubCACRL.ps1 並以 certutil -verify -urlfetch 檢查
 ==================================================
 "@ -ForegroundColor Cyan
-#endregion
+
+Stop-CATranscript

@@ -7,8 +7,13 @@
 #    1. 確認 CertSvc 服務運作中
 #    2. 產生新的 CRL 與 Delta CRL
 #    3. 複製 CRL 到 IIS 發布目錄
-#    4. 記錄執行結果至 Log 檔案
+#    4. 完整 CRL 剩餘天數低於 CRLExpiryWarningDays 時記錄 ERROR 並以非 0 結束碼結束
+#    5. 記錄執行結果至 Log 檔案（任何錯誤皆以結束碼 1 回報給 Task Scheduler）
+#
+#  部署注意：本腳本需與 Import-CAConfig.ps1、CAConfig.psd1 放在同一目錄
+#           （Register-CRLScheduledTask.ps1 會檢查）。
 # ============================================================
+#requires -Version 5.1
 
 #region ── 參數區（統一從 CAConfig.psd1 讀取，請至該檔案修改參數）──
 # 本腳本用到的區塊：Global（CRL 發布目錄，與 03 腳本共用同一份，
@@ -21,6 +26,12 @@ $Params = Merge-CAConfig -Sections 'Global','CRLPublish'
 # ── 初始化 Log ────────────────────────────────────────────────
 $LogDir = Split-Path $Params.LogPath -Parent
 New-Item -Path $LogDir -ItemType Directory -Force | Out-Null
+
+# Log 超過 5 MB 時輪替（舊檔由 Step 8 依保留天數清理）
+if ((Test-Path -LiteralPath $Params.LogPath) -and (Get-Item -LiteralPath $Params.LogPath).Length -gt 5MB) {
+    $RotatedName = '{0}_{1:yyyyMMdd_HHmmss}{2}' -f [IO.Path]::GetFileNameWithoutExtension($Params.LogPath), (Get-Date), [IO.Path]::GetExtension($Params.LogPath)
+    Rename-Item -LiteralPath $Params.LogPath -NewName $RotatedName
+}
 
 function Write-Log {
     param(
@@ -63,6 +74,7 @@ try {
         $Svc = Get-Service -Name 'CertSvc'
         if ($Svc.Status -ne 'Running') {
             Write-Log "CertSvc 啟動失敗，作業中止！" 'ERROR'
+            $ErrorCount++
             exit 1
         }
     }
@@ -71,38 +83,18 @@ try {
     # ── Step 2：取得 CA Config ────────────────────────────────
     Write-Log "Step 2：取得 CA 設定..."
 
-    $CAConfig = (certutil -getconfig) |
-        Where-Object { $_ -match '"(.+\\.+)"' } |
-        ForEach-Object { $_ -replace '.*"(.+)".*', '$1' } |
-        Select-Object -First 1
-    $CAConfig = $CAConfig.Trim()
-
-    if ([string]::IsNullOrWhiteSpace($CAConfig)) {
-        Write-Log "無法取得 CA Config！" 'ERROR'
-        exit 1
-    }
+    $CAConfig = Get-LocalCAConfigString
     Write-Log "CA Config：$CAConfig" 'OK'
 
-    # ── Step 3：確認目前 CRL 到期狀態 ────────────────────────
-    Write-Log "Step 3：確認目前 CRL 到期狀態..."
+    # ── Step 3：記錄目前 CRL 狀態（發布前）──────────────────
+    Write-Log "Step 3：確認目前 CRL 狀態..."
 
     $CRLFiles = Get-ChildItem -Path $Params.CRLPublishPath `
         -Filter '*.crl' -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -notlike 'rootCA*' -and $_.Name -notlike 'RootCA*' }
+        Where-Object { $_.Name -notlike 'RootCA*' }
 
     foreach ($CRLFile in $CRLFiles) {
-        try {
-            $CRL        = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2(
-                              $CRLFile.FullName)
-            # 注意：X509Certificate2 無法直接解析 CRL，
-            # 改用 certutil 取得到期時間
-            $CertutilOut = certutil -dump $CRLFile.FullName 2>$null |
-                Select-String 'Next Update'
-            Write-Log "目前 CRL：$($CRLFile.Name)（$CertutilOut）"
-        }
-        catch {
-            Write-Log "無法讀取 CRL 檔案：$($CRLFile.Name)" 'WARN'
-        }
+        Write-Log "目前 CRL：$($CRLFile.Name)（最後寫入 $($CRLFile.LastWriteTime)）"
     }
 
     # ── Step 4：產生新的 CRL 與 Delta CRL ────────────────────
@@ -149,21 +141,35 @@ try {
         Write-Log "  $($File.Name) | $($File.LastWriteTime) | $($File.Length) bytes"
     }
 
-    # ── Step 7：確認新 CRL 到期時間 ──────────────────────────
+    # ── Step 7：確認新 CRL 到期時間，並在剩餘天數不足時警示 ──
     Write-Log "Step 7：確認新 CRL 到期時間..."
 
     $PublishedCRLs = Get-ChildItem -Path $Params.CRLPublishPath -Filter '*.crl' |
-        Where-Object { $_.Name -notlike 'RootCA*' -and $_.Name -notlike 'rootCA*' }
+        Where-Object { $_.Name -notlike 'RootCA*' }
 
     foreach ($CRLFile in $PublishedCRLs) {
         $CertutilDump = certutil -dump $CRLFile.FullName 2>$null
-        $NextUpdate   = $CertutilDump | Select-String 'Next Update' |
+        $NextUpdateLine = $CertutilDump | Select-String -Pattern '^\s*(NextUpdate|Next Update|下次更新)\s*:' |
             Select-Object -First 1
-        $ThisUpdate   = $CertutilDump | Select-String 'This Update' |
+        $ThisUpdateLine = $CertutilDump | Select-String -Pattern '^\s*(ThisUpdate|This Update|此次更新)\s*:' |
             Select-Object -First 1
         Write-Log "[$($CRLFile.Name)]" 'OK'
-        Write-Log "  $ThisUpdate"
-        Write-Log "  $NextUpdate"
+        if ($ThisUpdateLine) { Write-Log "  $($ThisUpdateLine.Line.Trim())" }
+        if ($NextUpdateLine) { Write-Log "  $($NextUpdateLine.Line.Trim())" }
+
+        # Delta CRL（檔名含 '+'）週期短，只對完整 CRL 做到期警示
+        if ($CRLFile.Name -like '*+.crl' -or -not $NextUpdateLine) { continue }
+        $NextUpdate = [datetime]::MinValue
+        $RawValue   = ($NextUpdateLine.Line -split ':', 2)[1].Trim()
+        if ([datetime]::TryParse($RawValue, [ref]$NextUpdate)) {
+            $DaysLeft = ($NextUpdate - (Get-Date)).TotalDays
+            if ($DaysLeft -lt $Params.CRLExpiryWarningDays) {
+                Write-Log "$($CRLFile.Name) 將於 $([math]::Round($DaysLeft, 1)) 天後到期（警示門檻 $($Params.CRLExpiryWarningDays) 天）！" 'ERROR'
+                $ErrorCount++
+            }
+        } else {
+            Write-Log "無法解析 $($CRLFile.Name) 的 Next Update（'$RawValue'），略過到期警示。" 'WARN'
+        }
     }
 
 }
@@ -172,11 +178,12 @@ catch {
     $ErrorCount++
 }
 finally {
-    # ── Step 8：清理舊 Log 檔案 ──────────────────────────────
-    Write-Log "Step 8：清理 $($Params.LogRetentionDays) 天前的 Log..."
+    # ── Step 8：清理舊 Log 檔案（僅限本腳本的 CRL_Publish*.log，不動 01～08 的安裝記錄）──
+    Write-Log "Step 8：清理 $($Params.LogRetentionDays) 天前的 CRL 發布 Log..."
 
-    $OldLogs = Get-ChildItem -Path $LogDir -Filter '*.log' |
-        Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-$Params.LogRetentionDays) }
+    $LogLeafBase = [IO.Path]::GetFileNameWithoutExtension($Params.LogPath)
+    $OldLogs = Get-ChildItem -Path $LogDir -Filter "$LogLeafBase*.log" -ErrorAction SilentlyContinue |
+        Where-Object { $_.FullName -ne $Params.LogPath -and $_.LastWriteTime -lt (Get-Date).AddDays(-$Params.LogRetentionDays) }
 
     foreach ($OldLog in $OldLogs) {
         Remove-Item $OldLog.FullName -Force
@@ -192,3 +199,6 @@ finally {
     }
     Write-Log "========================================" 'INFO'
 }
+
+# 非 0 結束碼讓 Task Scheduler 的「上次執行結果」能反映失敗
+if ($ErrorCount -gt 0) { exit 1 }

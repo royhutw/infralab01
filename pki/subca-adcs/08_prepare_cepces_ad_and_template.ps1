@@ -2,6 +2,8 @@
 #  08_prepare_cepces_ad_and_template.ps1 (全篇零反引號防沾黏版)
 #  於 Enterprise Sub CA 伺服器上執行（需具備 Domain/Enterprise Admin 權限）
 # ============================================================
+#requires -Version 5.1
+#requires -RunAsAdministrator
 
 #region ── 參數區（統一從 CAConfig.psd1 讀取：Global、Templates、CepCes）──
 . (Join-Path $PSScriptRoot 'Import-CAConfig.ps1')
@@ -10,6 +12,16 @@ $Params = Merge-CAConfig -Sections 'Global','Templates','CepCes'
 $Params.ValidityTicks = [long]$Params.ValidityTicks
 $Params.RenewalTicks  = [long]$Params.RenewalTicks
 #endregion
+
+$ErrorActionPreference = 'Stop'
+$LogFile = Start-CATranscript -Name '08_prepare_cepces_ad_and_template' -Params $Params
+trap {
+    Write-Host ""
+    Write-Host "[ERROR] $($_.Exception.Message)" -ForegroundColor Red
+    Write-Host "        詳細記錄：$LogFile" -ForegroundColor Red
+    Stop-CATranscript
+    exit 1
+}
 
 foreach ($Feature in @('RSAT-AD-PowerShell', 'GPMC')) {
     if (-not (Get-WindowsFeature -Name $Feature).Installed) {
@@ -31,16 +43,7 @@ $ConfigNC       = ([ADSI]"LDAP://RootDSE").configurationNamingContext
 $TemplateBaseDN = "CN=Certificate Templates,CN=Public Key Services,CN=Services,$ConfigNC"
 $TargetOUDN     = "OU=$($Params.OUName),$($Params.DomainDN)"
 
-$CAConfig = (certutil -getconfig) |
-    Where-Object { $_ -match '"(.+\\.+)"' } |
-    ForEach-Object { $_ -replace '.*"(.+)".*', '$1' } |
-    Select-Object -First 1
-$CAConfig = $CAConfig.Trim()
-
-if ([string]::IsNullOrWhiteSpace($CAConfig)) {
-    Write-Host "[ERROR] 無法取得 CA Config，請確認在本機 Sub CA 上執行且 CertSvc 已啟動。" -ForegroundColor Red
-    exit 1
-}
+$CAConfig = Get-LocalCAConfigString
 Write-Host "[INFO] CA Config：$CAConfig" -ForegroundColor Gray
 Write-Host ""
 
@@ -274,56 +277,47 @@ if ($null -ne $ExistingTemplate) {
 Write-Host ""
 Write-Host "[5/6] 設定範本 Hardened ACL 並發布至 CA..." -ForegroundColor Yellow
 
-# 1. 處理 CEP-CES 專屬網頁伺服器範本 ($Params.WebTemplateName)
-dsacls "$ExistingTemplateDN" /P:Y 2>&1 | Out-Null
-dsacls "$ExistingTemplateDN" /R "NT AUTHORITY\SYSTEM" 2>&1 | Out-Null
-dsacls "$ExistingTemplateDN" /R "NT AUTHORITY\Authenticated Users" 2>&1 | Out-Null
+# 1. CEP-CES 專屬網頁伺服器範本：停用繼承，僅 CEP-CES 群組可 Enroll/Autoenroll
+$NetBIOS = $Params.NetBIOSDomainName
+$WebAclOk = Set-CertTemplateAcl -TemplateDN $ExistingTemplateDN -NetBIOSDomain $NetBIOS `
+    -EnrollPrincipals @($Params.GroupName) `
+    -FullControlPrincipals @('Domain Admins', 'Enterprise Admins') `
+    -Harden
+if (-not $WebAclOk) { throw "範本 $($Params.WebTemplateName) 的 ACL 設定或驗證失敗，未發布至 CA。" }
+Write-Host "      [OK] 已停用繼承並僅授權 $($Params.GroupName) 自動註冊 $($Params.WebTemplateName)" -ForegroundColor Green
 
-foreach ($AdminGroup in @('Domain Admins','Enterprise Admins')) {
-    dsacls "$ExistingTemplateDN" /G "$($Params.NetBIOSDomainName)\${AdminGroup}:GA" 2>&1 | Out-Null
-}
+Invoke-CertutilChecked -Arguments @('-config', $CAConfig, '-setcatemplates', "+$($Params.WebTemplateName)") `
+    -SuccessMessage "已將範本 $($Params.WebTemplateName) 發布至 CA" -FailureMessage "範本 $($Params.WebTemplateName) 發布失敗" -Indent '      '
 
-dsacls "$ExistingTemplateDN" /G "Authenticated Users:GR" 2>&1 | Out-Null
-dsacls "$ExistingTemplateDN" /G "$($Params.NetBIOSDomainName)\$($Params.GroupName):GR" 2>&1 | Out-Null
-dsacls "$ExistingTemplateDN" /G "$($Params.NetBIOSDomainName)\$($Params.GroupName):CA;Enroll" 2>&1 | Out-Null
-dsacls "$ExistingTemplateDN" /G "$($Params.NetBIOSDomainName)\$($Params.GroupName):CA;AutoEnrollment" 2>&1 | Out-Null
-
-Write-Host "      [OK] 已透過 dsacls 停用繼承並僅授權 $($Params.GroupName) 自動註冊 $($Params.WebTemplateName)" -ForegroundColor Green
-
-certutil -config $CAConfig -setcatemplates "+$($Params.WebTemplateName)" | Out-Null
-Write-Host "      [OK] 已將範本 $($Params.WebTemplateName) 發布至 CA" -ForegroundColor Green
-
-# 2. 處理 NPS / RADIUS 伺服器憑證範本 ($Params.NPSTemplateName) ACL 授權
+# 2. NPS / RADIUS 伺服器憑證範本 ($Params.NPSTemplateName) ACL 授權
 #    同時授權 NPSServersGroupName 群組與個別電腦帳號 (SamAccountName 含 $)，
 #    避免 Linux 主機剛加入群組時因 Kerberos 票證 PAC 尚未更新而遭 CA 拒絕 (0x80094012)。
+#    此範本的繼承設定由 04 負責（Hardened），這裡只新增授權，不更動繼承。
 $NPSTemplateDN  = "CN=$($Params.NPSTemplateName),$TemplateBaseDN"
 $NPSTemplateObj = Get-ADObject -Filter "distinguishedName -eq '$NPSTemplateDN'" -SearchBase $TemplateBaseDN -ErrorAction SilentlyContinue
 
 if ($null -ne $NPSTemplateObj) {
-    if (-not [string]::IsNullOrWhiteSpace($Params.NPSServersGroupName)) {
-        dsacls "$NPSTemplateDN" /G "$($Params.NetBIOSDomainName)\$($Params.NPSServersGroupName):GR" 2>&1 | Out-Null
-        dsacls "$NPSTemplateDN" /G "$($Params.NetBIOSDomainName)\$($Params.NPSServersGroupName):CA;Enroll" 2>&1 | Out-Null
-        dsacls "$NPSTemplateDN" /G "$($Params.NetBIOSDomainName)\$($Params.NPSServersGroupName):CA;AutoEnrollment" 2>&1 | Out-Null
-        Write-Host "      [OK] 已確保群組 $($Params.NetBIOSDomainName)\$($Params.NPSServersGroupName) 具備 $($Params.NPSTemplateName) 註冊權限" -ForegroundColor Green
-    }
+    $NPSPrincipals = @()
+    if (-not [string]::IsNullOrWhiteSpace($Params.NPSServersGroupName)) { $NPSPrincipals += $Params.NPSServersGroupName }
 
     foreach ($NPSCompName in $Params.NPSServerComputerNames) {
         try {
             $NPSCompObj = Get-ADComputer -Identity $NPSCompName -ErrorAction Stop
-            $NPSSamName = $NPSCompObj.SamAccountName  # 自動帶有結尾 $ 號 (例如 RADIUS3$)
-
-            dsacls "$NPSTemplateDN" /G "$($Params.NetBIOSDomainName)\${NPSSamName}:GR" 2>&1 | Out-Null
-            dsacls "$NPSTemplateDN" /G "$($Params.NetBIOSDomainName)\${NPSSamName}:CA;Enroll" 2>&1 | Out-Null
-            dsacls "$NPSTemplateDN" /G "$($Params.NetBIOSDomainName)\${NPSSamName}:CA;AutoEnrollment" 2>&1 | Out-Null
-            Write-Host "      [OK] 已直接賦予電腦帳號 $($Params.NetBIOSDomainName)\$NPSSamName 對 $($Params.NPSTemplateName) 的讀取與註冊權限" -ForegroundColor Green
+            $NPSPrincipals += $NPSCompObj.SamAccountName   # 自動帶有結尾 $ 號 (例如 RADIUS3$)
         }
         catch {
             Write-Host "      [WARNING] 找不到電腦帳號 $NPSCompName，略過個別授權：$($_.Exception.Message)" -ForegroundColor Yellow
         }
     }
 
-    certutil -config $CAConfig -setcatemplates "+$($Params.NPSTemplateName)" | Out-Null
-    Write-Host "      [OK] 已確認範本 $($Params.NPSTemplateName) 發布至 CA" -ForegroundColor Green
+    if ($NPSPrincipals.Count -gt 0) {
+        $NpsAclOk = Set-CertTemplateAcl -TemplateDN $NPSTemplateDN -NetBIOSDomain $NetBIOS -EnrollPrincipals $NPSPrincipals
+        if (-not $NpsAclOk) { throw "範本 $($Params.NPSTemplateName) 的 ACL 設定或驗證失敗，未發布至 CA。" }
+        Write-Host "      [OK] 已確保 $($NPSPrincipals -join ', ') 具備 $($Params.NPSTemplateName) 的讀取與註冊權限" -ForegroundColor Green
+    }
+
+    Invoke-CertutilChecked -Arguments @('-config', $CAConfig, '-setcatemplates', "+$($Params.NPSTemplateName)") `
+        -SuccessMessage "已確認範本 $($Params.NPSTemplateName) 發布至 CA" -FailureMessage "範本 $($Params.NPSTemplateName) 發布失敗" -Indent '      '
 } else {
     Write-Host "      [WARNING] 找不到憑證範本 $($Params.NPSTemplateName)，請確認是否已先執行 04_create_templates.ps1。" -ForegroundColor Yellow
 }
@@ -370,3 +364,5 @@ Write-Host @"
   再執行 09_install_cepces_server.ps1。
 ==================================================
 "@ -ForegroundColor Cyan
+
+Stop-CATranscript

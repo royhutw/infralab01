@@ -16,9 +16,16 @@
   01_install_adcs_dsc.ps1          安裝 AD CS 角色，產生 CSR
   02_install_subcacert.ps1         安裝 Root CA 簽回的憑證
   03_configure_cdp_aia.ps1         設定 CDP / AIA 發布點
-  04_create_templates.ps1          建立 EAP-TLS 憑證範本
+  04_create_templates.ps1          建立 EAP-TLS 憑證範本（已存在則略過；
+                                    加 -Recreate 才會刪除重建）
   05_configure_autoenrollment_gpo.ps1  設定憑證 Auto-Enrollment GPO
-  06_Deploy-RootCACert.ps1         透過 GPO 部署 Root CA 憑證至所有電腦
+  06_Deploy-RootCACert.ps1         發布 Root CA 憑證至 AD，並寫入 GPO
+                                    （用戶端是否生效請實測，見腳本完成提示）
+
+  ── 選用：獨立 CEP/CES 伺服器 ─────────────────────────────────
+  08_prepare_cepces_ad_and_template.ps1  在 Sub CA 上準備 CEP/CES 所需的 OU、
+                                    群組、Kerberos 限制委派、範本與 GPO
+  （../cepces/09_install_cepces_server.ps1  於 CEP/CES 主機上安裝服務）
 
   ── 上線後定期維運 ────────────────────────────────────────────
   Publish-SubCACRL.ps1             Sub CA CRL 定期發布（供排程呼叫）
@@ -26,9 +33,16 @@
                                     的 Windows 排程工作（只需執行一次）
 
   ── Sub CA 憑證到期 / 需要換金鑰時 ──────────────────────────
-  07_renew_subcacert.ps1           重新產生 Private Key 與 CSR，
-                                    完成後回到「二、完整部署流程」的
-                                    Root CA 簽發與 02、03 步驟重新走一次
+  07_renew_subcacert.ps1           以 certutil -renewcert 產生「新金鑰」的
+                                    更新 CSR（CA 不停機、不刪除資料庫與舊金鑰），
+                                    之後在 Root CA 簽發，再執行
+                                    02_install_subcacert.ps1 -Renewal
+                                    （見「七、Sub CA 憑證更新」）
+
+  所有腳本共用 Import-CAConfig.ps1 內的函式（記錄檔、certutil 呼叫、
+  DN 組合、GPO 登錄值、範本 ACL 等），不再各自維護一份。
+  01～08 執行時都會在 C:\CAConfig\Logs 產生 Transcript 記錄；
+  失敗時以結束碼 1 結束。
 
   【重要】所有網域名稱 / CA 名稱 / DN 欄位 / 路徑 / GPO 名稱 /
   排程時間等設定，一律只在 CAConfig.psd1 修改，不要在個別 .ps1
@@ -74,11 +88,13 @@
         → 建立並套用 Auto-Enrollment GPO
         ↓
   [DC 或 AD CS 伺服器] 執行 06_Deploy-RootCACert.ps1
-        → 透過 GPO 將 Root CA 憑證部署到網域所有電腦的
-          「受信任的根憑證授權單位」存放區
-          （用戶端需信任 Root CA，才能真正信任 Sub CA 簽發的憑證）
+        → 將 Root CA 憑證發布至 AD（Certification Authorities 容器），
+          並寫入 GPO；網域成員於 Auto-Enrollment / GPO 更新後信任 Root CA
+          （用戶端需信任 Root CA，才能真正信任 Sub CA 簽發的憑證；
+            完成後請在用戶端以 certlm.msc 實測確認）
         ↓
-  [AD CS 伺服器] 將 Publish-SubCACRL.ps1 複製到 C:\CAConfig\，
+  [AD CS 伺服器] 將 Publish-SubCACRL.ps1、Import-CAConfig.ps1、CAConfig.psd1
+                 三個檔案複製到 C:\CAConfig\（需同一目錄），
                  執行 Register-CRLScheduledTask.ps1
         → 建立每週一凌晨 02:00 自動發布 Sub CA CRL 的排程工作
           （CRL 有效期僅 1 週，務必設定排程，否則到期後
@@ -108,24 +124,35 @@
 ────────────────────────────────────────────────────────────────
   在 AD CS 伺服器（或獨立 Web 伺服器）設定 IIS：
 
-  1. 建立虛擬目錄，實體路徑指向 C:\CRLPublish
-     虛擬路徑：/CRL
-               /AIA
+  1. 建立虛擬目錄，實體路徑指向 C:\CRLPublish（CAConfig.psd1 的 Global.CRLPublishPath）
+     虛擬路徑：/CRL   （CDP：Global.CDPHttpUrl）
+               /AIA   （AIA：Global.AIAHttpUrl；兩者都要建立）
 
   2. 開放 .crl 和 .crt 的 MIME 類型：
      .crl → application/pkix-crl
      .crt → application/x-x509-ca-cert
+     （新版 IIS 預設已含這兩項；下方指令若回報重複項目可略過）
 
-  3. 確認 DNS 解析：
-     pki.corp.foo.bar.tw → AD CS 伺服器 IP
+  3. 允許 Delta CRL 檔名中的 "+"（否則 Delta CRL 會 404）：
+     requestFiltering 的 allowDoubleEscaping = true
+
+  4. 確認 DNS 解析（與 CDPHttpUrl / AIAHttpUrl 的主機名稱一致）：
+     crl.corp.foo.bar.tw → 提供 CRL/AIA 的 IIS 伺服器 IP
 
   PowerShell 快速設定 IIS：
   ─────────────────────────
     Install-WindowsFeature Web-Server -IncludeManagementTools
 
-    # 建立 CRL 虛擬目錄
+    # 建立 CRL / AIA 虛擬目錄
     New-WebVirtualDirectory -Site 'Default Web Site' `
         -Name 'CRL' -PhysicalPath 'C:\CRLPublish'
+    New-WebVirtualDirectory -Site 'Default Web Site' `
+        -Name 'AIA' -PhysicalPath 'C:\CRLPublish'
+
+    # 允許 Delta CRL 檔名中的 "+"
+    & "$env:windir\system32\inetsrv\appcmd.exe" set config 'Default Web Site' `
+        -section:system.webServer/security/requestFiltering `
+        /allowDoubleEscaping:true /commit:apphost
 
     # 新增 MIME 類型
     Add-WebConfigurationProperty -PSPath 'IIS:\Sites\Default Web Site' `
@@ -167,24 +194,33 @@
   適用時機：Sub CA 憑證即將到期、需要更換 CDP/AIA URL、
             或基於安全考量主動汰換金鑰時。
 
+  重要：更新「不是」重建 CA。舊金鑰與 CA 資料庫必須保留，
+        否則舊憑證時期簽發的憑證將無法撤銷、也無法再發布其 CRL。
+        07 以 certutil -renewcert 在執行中的 CA 上產生新金鑰的更新 CSR，
+        CA 不會停機。
+
   [AD CS 伺服器] 執行 07_renew_subcacert.ps1
-        → 停止 CA 服務、備份現有憑證、清除舊憑證與金鑰、
-          產生全新 Private Key 與 CSR
+        → 備份 CA（certutil -backup：私鑰 + 資料庫，會要求輸入密碼）、
+          設定 CAPolicy.inf 的 RenewalKeyLength（與 01 的金鑰長度一致）、
+          產生新金鑰與更新 CSR：C:\CAConfig\SubCA_renewal.req
         ↓
   [USB] 將新 CSR 複製到離線 Root CA VM：
         C:\RootCA\requests\intermediateCA.csr
         ↓
   [Root CA VM] 若需更換 CDP URL，先修改 ca-env.bat 的 CA_CRL_URL
                （見 Root CA 端 README「八、CRL Distribution Point」）
-               若舊憑證仍有效，先執行 04_revoke_cert.bat 撤銷
-               執行 02_sign_intermediate.bat 重新簽發
+               執行 02_sign_intermediate.bat 簽發更新憑證
+               ※ 不要撤銷舊的 Sub CA 憑證（會讓它簽發的所有憑證失效）。
+                 若因 unique_subject = yes 無法簽發相同 Subject，
+                 請在 Root CA 端調整該設定；撤銷僅限舊金鑰外洩時使用。
         ↓
   [USB] 將簽回的憑證複製回 AD CS 伺服器，改名為
         C:\CAConfig\SubCA_renewal.crt
         ↓
-  [AD CS 伺服器] 執行 02_install_subcacert.ps1 安裝新憑證
-                 執行 03_configure_cdp_aia.ps1 更新 CDP/AIA 設定
-                （若有異動）
+  [AD CS 伺服器] 執行 02_install_subcacert.ps1 -Renewal
+                 → 安裝新憑證、重啟 CertSvc、發布以新金鑰簽署的 CRL
+                 若 CDP/AIA 網址有異動，再執行 03_configure_cdp_aia.ps1
+                 確認 IIS 發布目錄出現新的 .crl / .crt（檔名含 (1) 等金鑰索引）
 
 
 八、驗證指令

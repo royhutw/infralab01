@@ -6,69 +6,43 @@
 #  將 Root CA 憑證部署到網域內所有電腦的
 #  受信任根憑證授權單位（Trusted Root Certification Authorities）存放區
 #
-#  部署方式：透過 GPO（群組原則）自動派發
-#    電腦設定 → Windows 設定 → 安全性設定
-#    → 公開金鑰原則 → 受信任的根憑證授權單位
+#  部署方式（兩條路徑並行）：
+#    1. certutil -dspublish ... RootCA：發布至 AD 的 Certification Authorities 容器，
+#       網域成員在 Auto-Enrollment（05 的 AEPolicy）執行時自動下載到受信任根存放區。
+#       這是主要、標準的機制。
+#    2. GPO 登錄值：將憑證以「序列化憑證存放區格式」（X509ContentType.SerializedCert，
+#       與公開金鑰原則寫入的 Blob 相同）寫入
+#       HKLM\SOFTWARE\Policies\Microsoft\SystemCertificates\Root\Certificates\<指紋>\Blob。
+#       寫入後會讀回比對；是否真的在用戶端生效，請依完成提示在用戶端實測。
 #
 #  適用網域：corp.foo.bar.tw
 #  執行地點：DC 或具備 GroupPolicy / RSAT 模組的成員伺服器
 #  執行身份：Domain Admins / Enterprise Admins
 # ============================================================
+#requires -Version 5.1
+#requires -RunAsAdministrator
 
 #region ── 參數區（統一從 CAConfig.psd1 讀取，請至該檔案修改參數）──
-# 本腳本用到的區塊：Global（網域名稱/DN、Root CA 憑證路徑）、
+# 本腳本用到的區塊：Global（網域名稱/DN、記錄目錄）、ExchangePaths（Root CA 憑證路徑）、
 # DeployRootCAGPO（GPO名稱/說明/登錄路徑）
 . (Join-Path $PSScriptRoot 'Import-CAConfig.ps1')
 $Params = Merge-CAConfig -Sections 'Global','ExchangePaths','DeployRootCAGPO'
 
-function Set-GPRegistryValueIfNeeded {
-    param(
-        [Parameter(Mandatory = $true)][string]$GpoName,
-        [Parameter(Mandatory = $true)][string]$Key,
-        [Parameter(Mandatory = $true)][string]$ValueName,
-        [Parameter(Mandatory = $true)][string]$Type,
-        [Parameter(Mandatory = $true)]$Value
-    )
-
-    $CurrentValue = Get-GPRegistryValue -Name $GpoName -Key $Key -ValueName $ValueName -ErrorAction SilentlyContinue
-    if ($null -ne $CurrentValue) {
-        $CurrentNormalized = switch ($Type) {
-            'Binary' {
-                if ($CurrentValue.Value -is [byte[]]) {
-                    ($CurrentValue.Value | ForEach-Object { $_.ToString('X2') }) -join ''
-                } else {
-                    [string]$CurrentValue.Value
-                }
-            }
-            'DWord' { [int]$CurrentValue.Value }
-            default { [string]$CurrentValue.Value }
-        }
-
-        $DesiredNormalized = switch ($Type) {
-            'Binary' {
-                if ($Value -is [byte[]]) {
-                    ($Value | ForEach-Object { $_.ToString('X2') }) -join ''
-                } else {
-                    [string]$Value
-                }
-            }
-            'DWord' { [int]$Value }
-            default { [string]$Value }
-        }
-
-        if ($CurrentNormalized -eq $DesiredNormalized) {
-            return $false
-        }
-    }
-
-    Set-GPRegistryValue -Name $GpoName -Key $Key -ValueName $ValueName -Type $Type -Value $Value | Out-Null
-    return $true
-}
-
+# Set-GPRegistryValueIfNeeded 已移至共用的 Import-CAConfig.ps1
 # ── 套用目標（網域根層級，涵蓋所有電腦）────────────────────
 # 直接沿用 Global.DomainDN，不再另外重複定義一份一樣的 DN 字串。
 $Params.GPOTarget = $Params.DomainDN
 #endregion
+
+$ErrorActionPreference = 'Stop'
+$LogFile = Start-CATranscript -Name '06_Deploy-RootCACert' -Params $Params
+trap {
+    Write-Host ""
+    Write-Host "[ERROR] $($_.Exception.Message)" -ForegroundColor Red
+    Write-Host "        詳細記錄：$LogFile" -ForegroundColor Red
+    Stop-CATranscript
+    exit 1
+}
 
 Write-Host ""
 Write-Host "=================================================="  -ForegroundColor Cyan
@@ -81,34 +55,32 @@ Write-Host ""
 
 # ── 確認必要模組 ─────────────────────────────────────────────
 Write-Host "[前置] 載入必要模組..." -ForegroundColor Yellow
-Import-Module GroupPolicy    -ErrorAction Stop
-Import-Module ActiveDirectory -ErrorAction Stop
+Import-Module GroupPolicy
+Import-Module ActiveDirectory
 Write-Host "      [OK] 模組載入完成" -ForegroundColor Green
 
 # ── 確認 Root CA 憑證檔案存在 ────────────────────────────────
 Write-Host "[前置] 確認 Root CA 憑證檔案..." -ForegroundColor Yellow
-if (-not (Test-Path $Params.RootCACertPath)) {
-    Write-Host "      [ERROR] 找不到 Root CA 憑證：$($Params.RootCACertPath)" -ForegroundColor Red
-    Write-Host "      請將 RootCA.crt 複製到指定路徑後重新執行。" -ForegroundColor Red
-    exit 1
+if (-not (Test-Path -LiteralPath $Params.RootCACertPath)) {
+    throw "找不到 Root CA 憑證：$($Params.RootCACertPath)（請將 RootCA.crt 複製到指定路徑後重新執行）。"
 }
 
 # 讀取並驗證憑證
-try {
-    $RootCACert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2(
-        $Params.RootCACertPath)
-    Write-Host "      [OK] 憑證讀取成功" -ForegroundColor Green
-    Write-Host "      Subject    : $($RootCACert.Subject)" -ForegroundColor Gray
-    Write-Host "      Thumbprint : $($RootCACert.Thumbprint)" -ForegroundColor Gray
-    Write-Host "      到期日     : $($RootCACert.NotAfter)" -ForegroundColor Gray
-    Write-Host "      是否為 CA  : $($RootCACert.Extensions |
-        Where-Object { $_.Oid.FriendlyName -eq 'Basic Constraints' } |
-        ForEach-Object { $_.CertificateAuthority })" -ForegroundColor Gray
+$RootCACert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($Params.RootCACertPath)
+$RootBasicConstraints = $RootCACert.Extensions |
+    Where-Object { $_ -is [System.Security.Cryptography.X509Certificates.X509BasicConstraintsExtension] }
+if ($null -eq $RootBasicConstraints -or -not $RootBasicConstraints.CertificateAuthority) {
+    throw "$($Params.RootCACertPath) 不是 CA 憑證（Basic Constraints: CA=TRUE 缺失），不可部署為受信任根。"
 }
-catch {
-    Write-Host "      [ERROR] 憑證檔案無效：$($_.Exception.Message)" -ForegroundColor Red
-    exit 1
+if ($RootCACert.Subject -ne $RootCACert.Issuer) {
+    throw "$($Params.RootCACertPath) 不是自簽的 Root CA 憑證（Subject 與 Issuer 不同）；受信任根必須是 Root CA 本身。"
 }
+if ($RootCACert.NotAfter -lt (Get-Date)) { throw "Root CA 憑證已過期（$($RootCACert.NotAfter)）。" }
+Write-Host "      [OK] 憑證讀取成功" -ForegroundColor Green
+Write-Host "      Subject    : $($RootCACert.Subject)" -ForegroundColor Gray
+Write-Host "      Thumbprint : $($RootCACert.Thumbprint)" -ForegroundColor Gray
+Write-Host "      到期日     : $($RootCACert.NotAfter)" -ForegroundColor Gray
+Write-Host "      記錄檔     : $LogFile" -ForegroundColor Gray
 
 #endregion
 
@@ -130,95 +102,48 @@ Write-Host "      GPO ID：$($GPO.Id)" -ForegroundColor Gray
 
 #region ── Step 2：將 Root CA 憑證寫入 GPO ───────────────────
 Write-Host ""
-Write-Host "[2/5] 將 Root CA 憑證寫入 GPO..." -ForegroundColor Yellow
+Write-Host "[2/5] 發布 Root CA 憑證並寫入 GPO..." -ForegroundColor Yellow
 
-# 取得 GPO 的 SYSVOL 路徑
-$GPOPath = "\\$($Params.DomainName)\SYSVOL\$($Params.DomainName)\Policies\{$($GPO.Id)}"
-
-# 確認 GPO 目錄結構
-$MachineRegPath = "$GPOPath\Machine\Microsoft\Windows NT\SecEdit"
-New-Item -Path $MachineRegPath -ItemType Directory -Force | Out-Null
-
-# ── 方法：使用 certutil 將憑證發布至 GPO ─────────────────────
-# certutil -dspublish 會將憑證寫入 AD，
-# 搭配 GPO 的「受信任根憑證授權單位」原則部署至所有電腦
-
-# 先將憑證加入本機受信任根憑證存放區（供立即生效）
+# 先將憑證加入本機受信任根憑證存放區（供本機立即生效）
 Write-Host "      將憑證加入本機受信任根存放區..." -ForegroundColor Gray
-$LocalStore = New-Object System.Security.Cryptography.X509Certificates.X509Store(
-    'Root', 'LocalMachine')
+$LocalStore = New-Object System.Security.Cryptography.X509Certificates.X509Store('Root', 'LocalMachine')
 $LocalStore.Open('ReadWrite')
-
-$ExistingCert = $LocalStore.Certificates |
-    Where-Object { $_.Thumbprint -eq $RootCACert.Thumbprint }
-
-if ($null -eq $ExistingCert) {
-    $LocalStore.Add($RootCACert)
-    Write-Host "      [OK] 已加入本機受信任根存放區" -ForegroundColor Green
-} else {
-    Write-Host "      [SKIP] 憑證已存在於本機存放區" -ForegroundColor Yellow
-}
-$LocalStore.Close()
-
-# ── 將憑證發布至 AD NTAuth 與 Root CA 容器 ───────────────────
-Write-Host "      發布 Root CA 憑證至 AD..." -ForegroundColor Gray
-$DspublishOutput = & certutil -dspublish -f $Params.RootCACertPath RootCA 2>&1
-if ($LASTEXITCODE -ne 0) {
-    Write-Host "      [ERROR] 發布 Root CA 憑證至 AD 失敗（退出碼：$LASTEXITCODE）" -ForegroundColor Red
-    $DspublishOutput | ForEach-Object { Write-Host "      $_" -ForegroundColor Red }
-    throw "Root CA 憑證發佈失敗。"
-}
-Write-Host "      [OK] 已發布至 AD" -ForegroundColor Green
-
-# ── 使用 GPO 登錄值部署憑證 ──────────────────────────────────
-# 將憑證的 Thumbprint 與二進位內容寫入 GPO 登錄設定
-# 讓所有收到此 GPO 的電腦自動信任此 Root CA
-
-$CertThumbprint = $RootCACert.Thumbprint
-$CertBytes      = $RootCACert.RawData
-
-# 將憑證二進位資料轉為 Hex 字串（GPO 登錄格式）
-$CertHex = ($CertBytes | ForEach-Object { $_.ToString('X2') }) -join ''
-
-# 寫入 GPO 登錄值（電腦設定）
-# 路徑對應：受信任的根憑證授權單位 → 憑證
-# （修正：原本這裡直接寫死登錄路徑字串，與參數區定義的
-#   TrustedRootStore 完全無關，改成實際引用該參數，
-#   避免兩處各自維護、以後修改其中一處卻忘了改另一處）
-$RegKey   = "$($Params.TrustedRootStore)\$CertThumbprint"
-
-# Blob 格式：3 個固定 DWORD + 憑證原始資料
-# DWORD 1：0x00000001（憑證類型）
-# DWORD 2：0x00000001（編碼類型 = X509_ASN_ENCODING）
-# DWORD 3：憑證資料長度
-$BlobPrefix = [byte[]](
-    0x01, 0x00, 0x00, 0x00,   # 憑證類型
-    0x01, 0x00, 0x00, 0x00,   # 編碼類型
-    ($CertBytes.Length -band 0xFF),
-    (($CertBytes.Length -shr 8) -band 0xFF),
-    (($CertBytes.Length -shr 16) -band 0xFF),
-    (($CertBytes.Length -shr 24) -band 0xFF)
-)
-$BlobData = $BlobPrefix + $CertBytes
-
 try {
-    $BlobChanged = Set-GPRegistryValueIfNeeded -GpoName $Params.GPOName `
-        -Key $RegKey `
-        -ValueName 'Blob' `
-        -Type 'Binary' `
-        -Value $BlobData
-
-    if ($BlobChanged) {
-        Write-Host "      [OK] 憑證已寫入 GPO 登錄設定" -ForegroundColor Green
+    if ($null -eq ($LocalStore.Certificates | Where-Object { $_.Thumbprint -eq $RootCACert.Thumbprint })) {
+        $LocalStore.Add($RootCACert)
+        Write-Host "      [OK] 已加入本機受信任根存放區" -ForegroundColor Green
     } else {
-        Write-Host "      [SKIP] GPO 登錄值已符合目標，未重複寫入" -ForegroundColor DarkGray
+        Write-Host "      [SKIP] 憑證已存在於本機存放區" -ForegroundColor Yellow
     }
-    Write-Host "      登錄路徑：$RegKey" -ForegroundColor Gray
+} finally {
+    $LocalStore.Close()
 }
-catch {
-    Write-Host "      [ERROR] 寫入 GPO 登錄值失敗：$($_.Exception.Message)" -ForegroundColor Red
-    throw
+
+# ── 路徑 1：發布至 AD 的 Certification Authorities 容器（主要機制）──
+Write-Host "      發布 Root CA 憑證至 AD..." -ForegroundColor Gray
+Invoke-CertutilChecked -Arguments @('-dspublish', '-f', $Params.RootCACertPath, 'RootCA') `
+    -SuccessMessage '已發布至 AD（Certification Authorities 容器）' `
+    -FailureMessage '發布 Root CA 憑證至 AD 失敗' -Indent '      '
+
+# ── 路徑 2：GPO 登錄值 ───────────────────────────────────────
+# Blob 必須是「序列化憑證存放區格式」（CertSerializeCertificateStoreElement），
+# 以 X509ContentType.SerializedCert 匯出即為此格式；不可自行拼接標頭。
+# 登錄路徑引用參數區的 TrustedRootStore，避免多處各自維護。
+$RegKey   = "$($Params.TrustedRootStore)\$($RootCACert.Thumbprint)"
+$BlobData = $RootCACert.Export([System.Security.Cryptography.X509Certificates.X509ContentType]::SerializedCert)
+
+$BlobChanged = Set-GPRegistryValueIfNeeded -GpoName $Params.GPOName `
+    -Key $RegKey `
+    -ValueName 'Blob' `
+    -Type 'Binary' `
+    -Value $BlobData
+
+if ($BlobChanged) {
+    Write-Host "      [OK] 憑證已寫入 GPO 登錄設定" -ForegroundColor Green
+} else {
+    Write-Host "      [SKIP] GPO 登錄值已符合目標，未重複寫入" -ForegroundColor DarkGray
 }
+Write-Host "      登錄路徑：$RegKey" -ForegroundColor Gray
 #endregion
 
 #region ── Step 3：連結 GPO 至網域根層級 ─────────────────────
@@ -252,30 +177,33 @@ Write-Host "      [OK] 本機 GPO 已更新" -ForegroundColor Green
 Write-Host ""
 Write-Host "[5/5] 驗證部署結果..." -ForegroundColor Yellow
 
-# 確認憑證是否在本機受信任根存放區
-$VerifyStore = New-Object System.Security.Cryptography.X509Certificates.X509Store(
-    'Root', 'LocalMachine')
-$VerifyStore.Open('ReadOnly')
-$DeployedCert = $VerifyStore.Certificates |
-    Where-Object { $_.Thumbprint -eq $RootCACert.Thumbprint }
-$VerifyStore.Close()
-
-if ($DeployedCert) {
-    Write-Host "      [OK] Root CA 憑證已在本機受信任根存放區" -ForegroundColor Green
-    Write-Host "      Subject    : $($DeployedCert.Subject)" -ForegroundColor Gray
-    Write-Host "      Thumbprint : $($DeployedCert.Thumbprint)" -ForegroundColor Gray
+# (a) AD 的 Certification Authorities 容器（網域成員 Auto-Enrollment 的來源）
+$ConfigNC = ([ADSI]"LDAP://RootDSE").configurationNamingContext
+$CaContainer = "CN=Certification Authorities,CN=Public Key Services,CN=Services,$ConfigNC"
+$InAD = Get-ADObject -SearchBase $CaContainer -SearchScope OneLevel -Filter * -Properties cACertificate |
+    Where-Object {
+        $_.cACertificate | Where-Object {
+            (New-Object System.Security.Cryptography.X509Certificates.X509Certificate2(,[byte[]]$_)).Thumbprint -eq $RootCACert.Thumbprint
+        }
+    }
+if ($InAD) {
+    Write-Host "      [OK] Root CA 憑證已在 AD 的 Certification Authorities 容器" -ForegroundColor Green
 } else {
-    Write-Host "      [WARN] 本機受信任根存放區找不到憑證，請手動確認。" -ForegroundColor Yellow
+    Write-Host "      [WARN] AD 的 Certification Authorities 容器找不到此憑證（可能尚未複寫），請稍後以 certutil -viewstore -enterprise Root 確認。" -ForegroundColor Yellow
 }
 
-# 確認 GPO 設定報告
-Write-Host ""
-Write-Host "      產生 GPO 報告..." -ForegroundColor Gray
-Get-GPOReport -Name $Params.GPOName `
-    -ReportType Html `
-    -Path       '.\RootCA_Deploy_GPO_Report.html' `
-    -Domain     $Params.DomainName
-Write-Host "      [OK] GPO 報告：.\RootCA_Deploy_GPO_Report.html" -ForegroundColor Green
+# (b) GPO 內的登錄值讀回比對
+$StoredBlob = (Get-GPRegistryValue -Name $Params.GPOName -Key $RegKey -ValueName 'Blob' -Domain $Params.DomainName -ErrorAction SilentlyContinue).Value
+if ($null -ne $StoredBlob -and (($StoredBlob | ForEach-Object { $_.ToString('X2') }) -join '') -eq (($BlobData | ForEach-Object { $_.ToString('X2') }) -join '')) {
+    Write-Host "      [OK] GPO 內的 Blob 與預期一致" -ForegroundColor Green
+} else {
+    Write-Host "      [WARN] GPO 內的 Blob 讀回後與預期不一致，請檢查 GPO 報告。" -ForegroundColor Yellow
+}
+
+# 產生 GPO 報告
+$ReportPath = Join-Path (Join-Path $Params.CAConfigDir 'Logs') 'RootCA_Deploy_GPO_Report.html'
+Get-GPOReport -Name $Params.GPOName -ReportType Html -Path $ReportPath -Domain $Params.DomainName
+Write-Host "      [OK] GPO 報告：$ReportPath" -ForegroundColor Green
 #endregion
 
 #region ── 完成提示 ──────────────────────────────────────────
@@ -291,24 +219,24 @@ Write-Host @"
   到期日    ：$($RootCACert.NotAfter)
 
   用戶端生效方式：
-    自動：等待 GPO 更新週期（約 90 分鐘）
-    手動：在用戶端執行 gpupdate /force
+    自動：等待 GPO 更新 / Auto-Enrollment 週期（約 90 分鐘）
+    手動：在用戶端執行 gpupdate /force 與 certutil -pulse
 
-  驗證方式（在用戶端執行）：
-    # 確認憑證是否已部署
+  【請務必在用戶端實測】本腳本只能驗證 AD 與 GPO 內容，無法確認用戶端是否真的信任：
     Get-ChildItem Cert:\LocalMachine\Root |
         Where-Object { `$_.Thumbprint -eq '$($RootCACert.Thumbprint)' }
-
-    # 或開啟憑證管理員確認
-    certlm.msc
-    → 受信任的根憑證授權單位 → 憑證
-    → 尋找：$($RootCACert.Subject)
+    （或 certlm.msc → 受信任的根憑證授權單位 → 憑證）
+    若 GPO 路徑未生效，AD 發布路徑（Auto-Enrollment）仍會讓網域成員信任此 Root CA；
+    也可改在 GPMC：電腦設定 → 原則 → Windows 設定 → 安全性設定 → 公開金鑰原則
+    → 受信任的根憑證授權單位 → 匯入。
 
   注意事項：
-    1. 新加入網域的電腦在第一次 GPO 套用後即自動信任
+    1. 新加入網域的電腦在第一次 GPO 套用 / Auto-Enrollment 後即自動信任
     2. 若有多台 DC，請等待 AD 複寫完成（預設 15 分鐘）
     3. 若環境有 OU 封鎖繼承（Block Inheritance），
        需另外在該 OU 連結此 GPO 或設定 Enforced
 ==================================================
 "@ -ForegroundColor Green
 #endregion
+
+Stop-CATranscript

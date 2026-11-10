@@ -5,13 +5,14 @@
 #  執行身份：SYSTEM（具備 CA 管理權限）
 # ============================================================
 
+#requires -Version 5.1
+#requires -RunAsAdministrator
+
 #region ── 參數區（統一從 CAConfig.psd1 讀取，請至該檔案修改參數）──
-# 本腳本用到的區塊：CRLScheduledTask（排程名稱/腳本路徑/觸發時間）
-#
-# 【變數命名統一】原本此腳本使用 $Params，其餘腳本一律
-# 使用 $Params，本次一併統一命名。
+# 本腳本用到的區塊：CRLScheduledTask（排程名稱/腳本路徑/觸發時間）、
+# CRLPublish（僅取用 LogPath，供提示訊息使用）
 . (Join-Path $PSScriptRoot 'Import-CAConfig.ps1')
-$Params = Merge-CAConfig -Sections 'CRLScheduledTask'
+$Params = Merge-CAConfig -Sections 'CRLScheduledTask','CRLPublish'
 #endregion
 
 Write-Host ""
@@ -23,8 +24,16 @@ Write-Host ""
 # ── 確認腳本檔案存在 ─────────────────────────────────────────
 if (-not (Test-Path $Params.ScriptPath)) {
     Write-Host "[ERROR] 找不到腳本：$($Params.ScriptPath)" -ForegroundColor Red
-    Write-Host "        請先將 Publish-SubCACRL.ps1 複製到指定路徑。" -ForegroundColor Red
+    Write-Host "        請先將 Publish-SubCACRL.ps1、Import-CAConfig.ps1、CAConfig.psd1 複製到同一個目錄。" -ForegroundColor Red
     exit 1
+}
+# Publish-SubCACRL.ps1 會以 $PSScriptRoot dot-source 共用載入器與設定檔，三者必須同目錄
+$ScriptDir = Split-Path -Path $Params.ScriptPath -Parent
+foreach ($Dependency in 'Import-CAConfig.ps1', 'CAConfig.psd1') {
+    if (-not (Test-Path -LiteralPath (Join-Path $ScriptDir $Dependency))) {
+        Write-Host "[ERROR] $ScriptDir 缺少 $Dependency（Publish-SubCACRL.ps1 執行時需要）。" -ForegroundColor Red
+        exit 1
+    }
 }
 Write-Host "[OK] 腳本檔案確認：$($Params.ScriptPath)" -ForegroundColor Green
 
@@ -68,19 +77,24 @@ $Trigger = New-ScheduledTaskTrigger `
     -At         $Params.TriggerTime
 
 # ── 設定排程工作選項 ─────────────────────────────────────────
-$Settings = New-ScheduledTaskSettingsSet `
-    -ExecutionTimeLimit     (New-TimeSpan -Minutes 30) `  # 最長執行 30 分鐘
-    -RestartCount           3 `                            # 失敗時最多重試 3 次
-    -RestartInterval        (New-TimeSpan -Minutes 5) `   # 重試間隔 5 分鐘
-    -StartWhenAvailable     $true `                        # 錯過時間時盡快執行
-    -RunOnlyIfNetworkAvailable $false `                    # 不需要網路連線（本機 CA）
-    -MultipleInstances      IgnoreNew                      # 若已在執行則忽略新觸發
+# 使用 splatting：不在續行反引號後面寫註解（反引號後面有空白或註解會讓續行失效）
+$SettingsParams = @{
+    ExecutionTimeLimit         = (New-TimeSpan -Minutes 30)  # 最長執行 30 分鐘
+    RestartCount               = 3                           # 失敗時最多重試 3 次
+    RestartInterval            = (New-TimeSpan -Minutes 5)   # 重試間隔 5 分鐘
+    StartWhenAvailable         = $true                       # 錯過時間時盡快執行
+    MultipleInstances          = 'IgnoreNew'                 # 若已在執行則忽略新觸發
+}
+# 本機 CA 不需要網路；未指定 -RunOnlyIfNetworkAvailable 即為「不需要網路」
+$Settings = New-ScheduledTaskSettingsSet @SettingsParams
 
 # ── 設定執行主體 ─────────────────────────────────────────────
-$Principal = New-ScheduledTaskPrincipal `
-    -UserId    $Params.RunAsUser `
-    -RunLevel  Highest `              # 以最高權限執行
-    -LogonType ServiceAccount         # 以服務帳號方式登入
+$PrincipalParams = @{
+    UserId    = $Params.RunAsUser
+    RunLevel  = 'Highest'          # 以最高權限執行
+    LogonType = 'ServiceAccount'   # 以服務帳號方式登入
+}
+$Principal = New-ScheduledTaskPrincipal @PrincipalParams
 
 # ── 建立排程工作 ─────────────────────────────────────────────
 $Task = New-ScheduledTask `
@@ -132,7 +146,7 @@ if ($TestRun -eq 'Y') {
         Write-Host "  [OK] 測試執行成功！" -ForegroundColor Green
     } else {
         Write-Host "  [WARN] 執行結果代碼：$($TaskInfo.LastTaskResult)，請查看 Log。" -ForegroundColor Yellow
-        Write-Host "         Log 路徑：C:\CAConfig\Logs\CRL_Publish.log" -ForegroundColor Yellow
+        Write-Host "         Log 路徑：$($Params.LogPath)" -ForegroundColor Yellow
     }
 }
 
@@ -145,14 +159,14 @@ Write-Host @"
     執行時間 ：每週 $($Params.TriggerDay) $($Params.TriggerTime)
     執行腳本 ：$($Params.ScriptPath)
     執行身份 ：$($Params.RunAsUser)
-    Log 位置 ：C:\CAConfig\Logs\CRL_Publish.log
+    Log 位置 ：$($Params.LogPath)
 
   手動執行方式：
     Start-ScheduledTask -TaskName '$($Params.TaskName)' ``
         -TaskPath '$($Params.TaskPath)'
 
   查看 Log：
-    Get-Content 'C:\CAConfig\Logs\CRL_Publish.log' -Tail 50
+    Get-Content '$($Params.LogPath)' -Tail 50
 
   注意事項：
     CRL 有效期設定為 1 週，排程為每週一執行

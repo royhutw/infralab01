@@ -141,11 +141,13 @@
     }
 
     # ── 07_renew_subcacert.ps1 專用（Renewal 特有路徑）───────
-    # CACommonName / DN 欄位 / DSC 憑證均與 01 共用（見上方區塊），
-    # 這裡只放 Renewal 流程獨有、且必須與初次安裝路徑區分的設定。
+    # 07 以 certutil -renewcert 產生「新金鑰」的更新 CSR，保留 CA 資料庫與舊金鑰
+    # （舊金鑰仍需用來簽署舊憑證的 CRL）。這裡只放 Renewal 流程獨有、
+    # 且必須與初次安裝路徑區分的設定。
     SubCARenewal = @{
-        RenewalCSROutputPath = 'C:\CAConfig\SubCA_renewal.req'
-        BackupPath           = 'C:\CAConfig\Backup'
+        RenewalCSROutputPath  = 'C:\CAConfig\SubCA_renewal.req'   # 07 產生的更新 CSR
+        RenewalSignedCertPath = 'C:\CAConfig\SubCA_renewal.crt'   # Root CA 簽回的更新憑證，02 -Renewal 安裝用
+        BackupPath            = 'C:\CAConfig\Backup'              # 07 的 CA 備份（含私鑰與資料庫）目錄
     }
 
     # ── Publish-SubCACRL.ps1 專用 ─────────────────────────────
@@ -154,9 +156,7 @@
         LogRetentionDays = 90
         CertEnrollPath   = 'C:\Windows\System32\CertSrv\CertEnroll'
 
-        # 【提醒，非修正但請留意】此值目前未被腳本本文實際使用
-        # （腳本只發布 CRL，尚未實作到期前提早警示的邏輯），
-        # 保留參數位置以便未來擴充，避免又要重新找地方定義它。
+        # 完整 CRL 剩餘天數低於此值時，Publish-SubCACRL.ps1 記錄 ERROR 並以結束碼 1 結束
         CRLExpiryWarningDays = 3
     }
 
