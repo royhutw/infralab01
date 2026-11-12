@@ -344,7 +344,7 @@ interface GigabitEthernet0/0
  description Upstream Link to Core Switch
  switchport trunk encapsulation dot1q
  switchport trunk native vlan 999
- switchport trunk allowed vlan 10,35,37,38,40,50,60,70-75,80,90,98
+ switchport trunk allowed vlan 10,34,35,37,38,40,50,60,70-75,80,90,98
  switchport mode trunk
  ip dhcp snooping trust
  ip arp inspection trust
@@ -471,7 +471,7 @@ interface GigabitEthernet3/3
  description Downlink to another Edge Swtich
  switchport trunk encapsulation dot1q
  switchport trunk native vlan 999
- switchport trunk allowed vlan 10,35,37,38,40,50,60,70-75,80,90,98
+ switchport trunk allowed vlan 10,34,35,37,38,40,50,60,70-75,80,90,98
  switchport mode trunk
  ip dhcp snooping trust
  ip arp inspection trust
