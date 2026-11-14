@@ -397,30 +397,26 @@ interface GigabitEthernet0/2
  dot1x timeout server-timeout 10
  dot1x timeout held-period 60
  
- ! Guest VLAN 90 / Critical VLAN 98
+ ! Critical VLAN 98
+ ! RADIUS 恢復連線 (Server Alive) 自動重驗切回正式 VLAN
  authentication event server alive action reinitialize
  authentication periodic
- ! Microsoft NPS上設定重新認證的時間為86,400秒
+ ! RADIUS 上設定重新認證的時間為86,400秒
  authentication timer reauthenticate server
  authentication timer restart 30
- ! VLAN指派由NPS進行Fail / no-response 政策管理, 但仍使用以下設定作為保底:
+ ! 驗證失敗 (Access-Reject) 處理：導向隔離區 VLAN 98
  authentication event fail action authorize vlan 98
  ! =========================================================
- ! NPS 離線與失敗處置（關鍵修改）
+ ! RADIUS 全部離線 (Server Dead) 雙域逃生機制
  ! =========================================================
  ! 1. 當 RADIUS 伺服器 Dead (離線) 時：
  !    - Data Domain (後接 PC) 進入 Critical VLAN 98
  !    - Voice Domain (IP Phone) 自動放行並指派至 switchport voice vlan (VLAN 38)
  authentication event server dead action authorize vlan 98
  authentication event server dead action authorize voice
- ! 2. 當 RADIUS 伺服器 Alive 但無回應 / 未註冊 (No Response) 時：
- !    - Data Domain 進入 Guest VLAN 90
- !    - Voice Domain 自動放行至 Voice VLAN (VLAN 38)
- authentication event no-response action authorize vlan 90
- authentication event no-response action authorize voice
 
- ip arp inspection limit rate 15
- ip dhcp snooping limit rate 15
+ ip arp inspection limit rate 20
+ ip dhcp snooping limit rate 20
  ! 暫停 ip verify source
  spanning-tree portfast
 
@@ -453,11 +449,10 @@ interface GigabitEthernet0/3
  dot1x timeout server-timeout 10
  dot1x timeout held-period 60
  
- ! Guest VLAN 90 / Critical VLAN 98
+ ! Critical VLAN 98
  authentication event server alive action reinitialize
  ! VLAN指派由NPS進行Fail / no-response 政策管理, 但仍使用以下設定作為保底:
  authentication event fail action authorize vlan 98
- authentication event no-response action authorize vlan 90
  authentication event server dead action authorize vlan 98
  
  ! Port 防護 (IPSG / DAI )

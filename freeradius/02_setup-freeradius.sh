@@ -1,7 +1,6 @@
-cat << 'EOF' > 02_setup-freeradius.sh
 #!/usr/bin/env bash
 # ==============================================================================
-#  02_setup-freeradius.sh (v6 終極實戰驗收版・支援 EAP-TEAP / EAP-TLS / MAB)
+#  02_setup-freeradius.sh (v7.1 終極實戰驗收版・支援 EAP-TEAP / EAP-TLS / MAB / VoIP OUI)
 #  適用系統：Debian 13 (Trixie) / FreeRADIUS 3.2.7
 #  前置條件：
 #    1. 同目錄下需存在 config.env
@@ -18,14 +17,18 @@ if [ ! -f "${CONFIG_FILE}" ]; then
     exit 1
 fi
 source "${CONFIG_FILE}"
+
+VOICE_VLAN="${VOICE_VLAN:-38}"
+VOIP_OUI_REGEX="${VOIP_OUI_REGEX:-^(0c383e|0001e3|00036b|001243|00096e|00040d|001b4f|000fe2|0060b9|00d01e|00e075|0004f2|0011a6|00e0bb|000b82|001565)}"
 # ──────────────────────────────────────────────────────────────────────────────
 
 echo "=============================================================================="
-echo " 開始執行 FreeRADIUS 802.1X (EAP-TEAP / EAP-TLS / MAB) 自動化部署 (v6)"
+echo " 開始執行 FreeRADIUS 802.1X (EAP-TEAP / EAP-TLS / MAB / VoIP) 自動化部署 (v7.1)"
 echo " 主機 FQDN  : ${HOSTNAME_FQDN}"
 echo " 目標 AD DC : ${LDAP_SERVER}"
 echo " 目標群組 OU: ${HQ_GROUP_OU}"
 echo " 交換器網段 : ${SW_SUBNET}"
+echo " 語音 VLAN  : ${VOICE_VLAN} (OUI Match: ${VOIP_OUI_REGEX})"
 echo "=============================================================================="
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -293,15 +296,25 @@ EOF
 chown root:freerad "${FR_CONF_DIR}/mods-available/eap"
 chmod 640 "${FR_CONF_DIR}/mods-available/eap"
 
+# 若已執行過 03_setup-crl-sync.sh，自動保留 check_crl = yes 並重新合成含 CRL 的憑證鏈
+if [ -x "${SYNC_SCRIPT_PATH:-/usr/local/bin/update-freeradius-crl.sh}" ]; then
+    echo "    [INFO] 偵測到已部署 03 CRL 同步腳本，自動保留 check_crl = yes 並同步 CRL..."
+    cp -f "${CONFIG_FILE}" "${INSTALLED_ENV_FILE}"
+    chmod 640 "${INSTALLED_ENV_FILE}"
+    sed -i '/ca_path =/a \        check_crl = yes' "${FR_CONF_DIR}/mods-available/eap"
+    "${SYNC_SCRIPT_PATH}" || true
+fi
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  [步驟 7/7] 設定動態 VLAN 判斷策略與虛擬伺服器 (Policy + Sites)
 # ══════════════════════════════════════════════════════════════════════════════
 echo ""
-echo "==> [7/7] 寫入五段式群組動態 VLAN 策略與虛擬伺服器組態..."
+echo "==> [7/7] 寫入五段式群組動態 VLAN 與多廠牌 VoIP OUI 策略組態..."
 
 cat << 'EOF' > "${FR_CONF_DIR}/policy.d/corp_8021x_vlan"
 # ==============================================================================
-#  CORP.FOO.BAR.TW 802.1X 動態 VLAN 指派核心邏輯 (支援 EAP-TEAP / EAP-TLS / MAB)
+#  CORP.FOO.BAR.TW 802.1X 動態 VLAN 指派核心邏輯
+#  支援：EAP-TEAP / EAP-TLS / AD MAB / 多廠牌 VoIP OUI 自動派發 Voice Domain
 # ==============================================================================
 
 normalize_ad_identity {
@@ -372,15 +385,18 @@ evaluate_mab_vlan {
     }
 
     ldap.authorize
+    # 情況 1：AD 中已建檔納管的 MAC 帳號
     if (ok || updated) {
+        # 若帳號被停用 -> 立即拒絕 (交換器導向隔離區 VLAN 98)
         if (&control:Tmp-Integer-0 && ("%{expr:%{control:Tmp-Integer-0} & 2}" == "2")) {
             reject
         }
 
         foreach &control:LDAP-Group {
-            if ("%{Foreach-Variable-0}" =~ /^CN=SG-HQ-8021X-VLAN([0-9]+)-[^,]+-MAB,/i) {
+            if ("%{Foreach-Variable-0}" =~ /^CN=SG-HQ-8021X-VLAN([0-9]+)-([^,]+)-MAB,/i) {
                 update session-state {
                     &Tmp-String-0 := "%{1}"
+                    &Tmp-String-2 := "%{2}"
                 }
                 break
             }
@@ -390,9 +406,18 @@ evaluate_mab_vlan {
             reject
         }
     }
+    # 情況 2：AD 中查無此 MAC -> 先檢查是否屬於已知廠牌 VoIP 話機 OUI
     elsif (notfound) {
-        update session-state {
-            &Tmp-String-0 := "__GUEST_VLAN__"
+        if (&Stripped-User-Name =~ /__VOIP_OUI_REGEX__/i) {
+            update session-state {
+                &Tmp-String-0 := "__VOICE_VLAN__"
+                &Tmp-String-2 := "VOICE_OUI_AUTO"
+            }
+        }
+        else {
+            update session-state {
+                &Tmp-String-0 := "__GUEST_VLAN__"
+            }
         }
     }
     else {
@@ -407,12 +432,26 @@ apply_vlan_reply {
     }
 
     if (&session-state:Tmp-String-0) {
-        update reply {
-            &Tunnel-Type := VLAN
-            &Tunnel-Medium-Type := IEEE-802
-            &Tunnel-Private-Group-Id := &session-state:Tmp-String-0
-            &Session-Timeout := __REAUTH_TIMEOUT__
-            &Termination-Action := RADIUS-Request
+        # 若判定為語音 VLAN (38) 或 VoIP 設備，回傳 Cisco 專屬語音域屬性 (進入 Domain: VOICE)
+        if ((&session-state:Tmp-String-0 == "__VOICE_VLAN__") || (&session-state:Tmp-String-2 && (&session-state:Tmp-String-2 =~ /VOICE|IPPhone|Phone/i))) {
+            update reply {
+                &Cisco-AVPair := "device-traffic-class=voice"
+                &Tunnel-Type := VLAN
+                &Tunnel-Medium-Type := IEEE-802
+                &Tunnel-Private-Group-Id := &session-state:Tmp-String-0
+                &Session-Timeout := __REAUTH_TIMEOUT__
+                &Termination-Action := RADIUS-Request
+            }
+        }
+        # 一般資料域設備 (進入 Domain: DATA)
+        else {
+            update reply {
+                &Tunnel-Type := VLAN
+                &Tunnel-Medium-Type := IEEE-802
+                &Tunnel-Private-Group-Id := &session-state:Tmp-String-0
+                &Session-Timeout := __REAUTH_TIMEOUT__
+                &Termination-Action := RADIUS-Request
+            }
         }
     }
 }
@@ -421,6 +460,8 @@ EOF
 DOMAIN_REGEX=$(echo "${DOMAIN}" | sed 's/\./\\./g')
 sed -i "s|__DOMAIN_REGEX__|${DOMAIN_REGEX}|g" "${FR_CONF_DIR}/policy.d/corp_8021x_vlan"
 sed -i "s|__GUEST_VLAN__|${GUEST_VLAN}|g" "${FR_CONF_DIR}/policy.d/corp_8021x_vlan"
+sed -i "s|__VOICE_VLAN__|${VOICE_VLAN}|g" "${FR_CONF_DIR}/policy.d/corp_8021x_vlan"
+sed -i "s@__VOIP_OUI_REGEX__@${VOIP_OUI_REGEX}@g" "${FR_CONF_DIR}/policy.d/corp_8021x_vlan"
 sed -i "s|__REAUTH_TIMEOUT__|${REAUTH_TIMEOUT}|g" "${FR_CONF_DIR}/policy.d/corp_8021x_vlan"
 
 cat << 'EOF' > "${FR_CONF_DIR}/sites-available/check-eap-tls"
@@ -546,6 +587,13 @@ server default {
 }
 EOF
 
+# 若已執行過 04_setup-nac-json-log.sh，自動保留 linelog_nac_json 掛載
+if [ -f "${FR_CONF_DIR}/mods-enabled/linelog_nac_json" ]; then
+    echo "    [INFO] 偵測到已啟用 linelog_nac_json，自動掛載至 default 虛擬伺服器..."
+    sed -i '/apply_vlan_reply/a \        linelog_nac_json' "${FR_CONF_DIR}/sites-available/default"
+    sed -i '/attr_filter.access_reject/a \            linelog_nac_json' "${FR_CONF_DIR}/sites-available/default"
+fi
+
 chown -R root:freerad "${FR_CONF_DIR}/policy.d" "${FR_CONF_DIR}/sites-available" "${FR_CONF_DIR}/sites-enabled"
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -562,7 +610,7 @@ systemctl restart freeradius
 systemctl status freeradius --no-pager
 
 echo "=============================================================================="
-echo " [SUCCESS] FreeRADIUS 802.1X 動態 VLAN 伺服器部署完成 (v6)！"
+echo " [SUCCESS] FreeRADIUS 802.1X 動態 VLAN 伺服器部署完成 (v7.1)！"
+echo "   - 語音設備 OUI 自動放行 : VLAN ${VOICE_VLAN} (Cisco-AVPair = device-traffic-class=voice)"
+echo "   - 未知訪客設備自動放行 : Guest VLAN ${GUEST_VLAN}"
 echo "=============================================================================="
-EOF
-chmod +x 02_setup-freeradius.sh
